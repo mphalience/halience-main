@@ -1,0 +1,153 @@
+package ai.halience.llm.router.provider;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.function.Consumer;
+
+import ai.halience.llm.router.model.EmbeddingResponse;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+import ai.halience.llm.router.provider.compatible.ProviderHttpException;
+
+/**
+ * Translates the unified {@link Request}/{@link Response} shapes to/from one provider's wire
+ * format — see {@code LIBRARY_SPEC.md} §8.1. All routing, fallback, capability negotiation, and
+ * cost logic lives in the router core and is shared across every provider; an adapter's only
+ * job is the request/response translation for the one provider it implements, and reporting
+ * whether it currently has usable credentials.
+ *
+ * <p>{@link #send} and {@link #sendAsync} are always called with an already-negotiated request
+ * (see {@code CapabilityNegotiator}) for one specific, fully-resolved model id — an adapter
+ * never needs to consult the Model Capability Table itself to decide what it can send, only to
+ * translate it.
+ *
+ * <p>The {@link Response} an adapter returns is a <em>fragment</em>: {@code content},
+ * {@code toolCalls}, {@code usage} (raw token counts; cost is filled in by the router core from
+ * the Model Capability Table, unless the adapter sets the provider's own reported cost in
+ * {@code estimatedCostUsdMicros}/{@code estimatedCostUsdCents}, which the router then keeps),{@code generatedFiles}, and {@code original} are populated;
+ * {@code providerUsed}, {@code modelUsed}, {@code attempts}, {@code droppedFeatures}, and
+ * {@code structuredOutput} are left at their defaults and filled in by the router core.
+ */
+public interface ProviderAdapter {
+
+    /**
+     * Shared fallback executor for {@link #sendAsync}'s default implementation — one virtual
+     * thread per call. Adapters backed by an SDK with a genuinely non-blocking async client (or
+     * by non-blocking HTTP I/O) override {@link #sendAsync} instead of using this.
+     */
+    ExecutorService DEFAULT_ASYNC_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+
+    /** The canonical provider id this adapter implements. */
+    Provider id();
+
+    /** Credential check — see {@code LIBRARY_SPEC.md} §6. */
+    boolean isAvailable();
+
+    /**
+     * Sends one already-negotiated request to {@code model} and returns the response fragment,
+     * blocking the calling thread until it completes.
+     *
+     * @throws RuntimeException (provider/SDK-specific) if the call fails — the router core
+     *         catches this and records the attempt as failed, per §5.1.1
+     */
+    Response send(String model, Request adaptedRequest);
+
+    /**
+     * Async counterpart of {@link #send}. The default implementation runs {@link #send} on a
+     * fresh virtual thread and completes the returned future when it finishes — the "spin up a
+     * thread and call back when done" fallback for a provider with no native non-blocking path.
+     * Override this when the provider offers real non-blocking I/O (an async SDK client, or
+     * non-blocking HTTP) instead.
+     */
+    default CompletableFuture<Response> sendAsync(String model, Request adaptedRequest) {
+        return CompletableFuture.supplyAsync(() -> send(model, adaptedRequest), DEFAULT_ASYNC_EXECUTOR);
+    }
+
+    /**
+     * Why this adapter can't enforce {@code responseSchema} natively on {@code model} — the
+     * provider's structured-output mode rejects something the schema uses — or {@code null} if it
+     * can (the default). The router asks before each attempt that would send a schema natively, and
+     * when there's a problem treats the candidate as lacking native structured output for that
+     * request: per {@code structuredOutputStrategy} the schema goes into the prompt instead
+     * ({@code AUTO}, {@code PROMPT_FALLBACK}) or is dropped and reported in {@code droppedFeatures}
+     * ({@code NATIVE}), and if {@code RESPONSE_SCHEMA} is a required feature the candidate is skipped
+     * with this reason — see {@code LIBRARY_SPEC.md} §4. Adapters that rewrite schemas to fit their
+     * provider (e.g. adding {@code additionalProperties: false}) report only what they can't rewrite.
+     */
+    default String responseSchemaProblem(String model, Map<String, Object> responseSchema) {
+        return null;
+    }
+
+    /**
+     * Whether {@code failure}, thrown by one of this adapter's sends, is worth retrying on the same
+     * model when {@code RouterConfig.maxRetries} allows (§5.5): a rate limit, a server error, or a
+     * dropped connection, rather than a bad request or bad credentials. The default recognises
+     * {@link ProviderHttpException} with a status from {@link TransientFailures#isTransientStatus}
+     * and I/O errors; SDK-backed adapters override it for their SDK's exceptions.
+     */
+    default boolean isTransient(Throwable failure) {
+        ProviderHttpException http = TransientFailures.find(failure, ProviderHttpException.class);
+        if (http != null) {
+            return TransientFailures.isTransientStatus(http.statusCode());
+        }
+        return TransientFailures.isIoFailure(failure);
+    }
+
+    /**
+     * The wait the provider asked for before a retry of {@code failure} (its {@code Retry-After}),
+     * or {@code null} if it gave none, in which case the router uses {@code RouterConfig.retryDelay}.
+     */
+    default Duration retryAfter(Throwable failure) {
+        ProviderHttpException http = TransientFailures.find(failure, ProviderHttpException.class);
+        return http == null ? null : http.retryAfter();
+    }
+
+    /**
+     * The model {@code LlmRouter.embed} uses for this provider when a route names the provider but
+     * no model; {@code null} (the default) means this adapter offers no embeddings.
+     */
+    default String defaultEmbeddingModel() {
+        return null;
+    }
+
+    /**
+     * Embeds {@code texts} with {@code model}, returning one vector per text in order, and the
+     * tokens used. The default throws {@link UnsupportedOperationException}; adapters for providers
+     * with an embeddings API override it together with {@link #defaultEmbeddingModel()}.
+     *
+     * @param dimensions requested vector length, or {@code null} for the model's default
+     */
+    default EmbeddingResponse embed(String model, List<String> texts, Integer dimensions) {
+        throw new UnsupportedOperationException(id() + " adapter offers no embeddings");
+    }
+
+    /**
+     * Streaming counterpart of {@link #send}: calls {@code onText} with each piece of the
+     * response's text as the provider generates it, then returns the complete response fragment,
+     * exactly as {@link #send} would have. The default implementation doesn't stream — it calls
+     * {@link #send} and delivers the whole text in one piece — so every adapter supports
+     * {@code LlmRouter.completeStreaming}; override it for providers with a native streaming API.
+     */
+    default Response sendStreaming(String model, Request adaptedRequest, Consumer<String> onText) {
+        Response response = send(model, adaptedRequest);
+        if (response.getContent() != null && !response.getContent().isEmpty()) {
+            onText.accept(response.getContent());
+        }
+        return response;
+    }
+
+    /**
+     * Async counterpart of {@link #sendStreaming}. The default implementation runs
+     * {@link #sendStreaming} on a fresh virtual thread, so an adapter that streams natively keeps
+     * streaming (with {@code onText} called from that thread) and one that doesn't still delivers
+     * its whole text in one piece. Override it only for a provider with a genuinely non-blocking
+     * streaming API.
+     */
+    default CompletableFuture<Response> sendStreamingAsync(String model, Request adaptedRequest, Consumer<String> onText) {
+        return CompletableFuture.supplyAsync(() -> sendStreaming(model, adaptedRequest, onText), DEFAULT_ASYNC_EXECUTOR);
+    }
+}

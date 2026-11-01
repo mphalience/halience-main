@@ -1,0 +1,321 @@
+package ai.halience.llm.router.provider.compatible;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.when;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import ai.halience.llm.router.model.Attachment;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+import ai.halience.llm.router.model.ToolDefinition;
+import ai.halience.llm.router.provider.Provider;
+import ai.halience.llm.router.provider.compatible.HttpTransport.HttpRequestRecord;
+import ai.halience.llm.router.provider.compatible.HttpTransport.HttpResponseRecord;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+@ExtendWith(MockitoExtension.class)
+class OpenAiCompatibleHttpAdapterTest {
+
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    @Mock
+    private HttpTransport transport;
+
+    @Test
+    void idAndAvailability() {
+        assertThat(new NvidiaAdapter("key", transport).id()).isEqualTo(Provider.NVIDIA);
+        assertThat(new NvidiaAdapter("key", transport).isAvailable()).isTrue();
+        assertThat(new NvidiaAdapter(null, transport).isAvailable()).isFalse();
+        assertThat(new NvidiaAdapter("", transport).isAvailable()).isFalse();
+    }
+
+    @Test
+    void sendBuildsExpectedRequestBodyAndParsesResponse() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("Hello there", 10, 5));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("secret-key", transport);
+        Response response = adapter.send("some-model", Request.builder()
+                .prompt("Hi")
+                .systemInstructions("Be terse.")
+                .build());
+
+        assertThat(response.getContent()).isEqualTo("Hello there");
+        assertThat(response.getUsage().getInputTokens()).isEqualTo(10);
+        assertThat(response.getUsage().getOutputTokens()).isEqualTo(5);
+
+        HttpRequestRecord sent = captor.getValue();
+        assertThat(sent.url()).isEqualTo("https://integrate.api.nvidia.com/v1/chat/completions");
+        assertThat(sent.headers()).containsEntry("Authorization", "Bearer secret-key");
+
+        JsonNode body = JSON.readTree(sent.jsonBody());
+        assertThat(body.path("model").asText()).isEqualTo("some-model");
+        assertThat(body.path("messages").get(0).path("role").asText()).isEqualTo("system");
+        assertThat(body.path("messages").get(0).path("content").asText()).isEqualTo("Be terse.");
+        assertThat(body.path("messages").get(1).path("content").asText()).isEqualTo("Hi");
+    }
+
+    @Test
+    void sendCapsMaxTokensAtTheRequestsMaxOutputTokens() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        adapter.send("some-model", Request.builder().prompt("Hi").maxOutputTokens(300).build());
+
+        assertThat(JSON.readTree(captor.getValue().jsonBody()).path("max_tokens").asLong()).isEqualTo(300);
+    }
+
+    @Test
+    void sendIncludesToolsAndResponseFormatWhenPresent() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        adapter.send("some-model", Request.builder()
+                .prompt("hi")
+                .tools(List.of(ToolDefinition.builder().name("lookup").description("d").parameters(Map.of("type", "object")).build()))
+                .responseSchema(Map.of("type", "object", "properties", Map.of()))
+                .build());
+
+        JsonNode body = JSON.readTree(captor.getValue().jsonBody());
+        assertThat(body.path("tools").get(0).path("function").path("name").asText()).isEqualTo("lookup");
+        assertThat(body.path("response_format").path("type").asText()).isEqualTo("json_schema");
+    }
+
+    @Test
+    void sendIncludesTemperatureAndTopPWhenPresent() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        adapter.send("some-model", Request.builder().prompt("hi").temperature(0.7).topP(0.9).build());
+
+        JsonNode body = JSON.readTree(captor.getValue().jsonBody());
+        assertThat(body.path("temperature").asDouble()).isEqualTo(0.7);
+        assertThat(body.path("top_p").asDouble()).isEqualTo(0.9);
+    }
+
+    @Test
+    void sendOmitsTemperatureAndTopPWhenAbsent() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        adapter.send("some-model", Request.builder().prompt("hi").build());
+
+        JsonNode body = JSON.readTree(captor.getValue().jsonBody());
+        assertThat(body.has("temperature")).isFalse();
+        assertThat(body.has("top_p")).isFalse();
+    }
+
+    @Test
+    void sendMapsImageAttachmentToImageUrlContentPart() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        adapter.send("some-model", Request.builder()
+                .prompt("describe this")
+                .attachments(List.of(Attachment.builder().mediaType("image/png").data(new byte[]{1, 2, 3}).build()))
+                .build());
+
+        JsonNode lastMessage = JSON.readTree(captor.getValue().jsonBody()).path("messages").get(0);
+        assertThat(lastMessage.path("content").get(0).path("type").asText()).isEqualTo("text");
+        assertThat(lastMessage.path("content").get(1).path("type").asText()).isEqualTo("image_url");
+        assertThat(lastMessage.path("content").get(1).path("image_url").path("url").asText()).startsWith("data:image/png;base64,");
+    }
+
+    @Test
+    void openRouterSendsDocumentAttachmentsAsFileContentParts() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        OpenRouterAdapter adapter = new OpenRouterAdapter("key", transport);
+        adapter.send("google/gemini-3.8-flash", Request.builder()
+                .prompt("summarise these")
+                .attachments(List.of(
+                        Attachment.builder().mediaType("application/pdf").data(new byte[]{1, 2, 3}).filename("report.pdf").build(),
+                        Attachment.builder().mediaType("image/png").data(new byte[]{4}).build(),
+                        Attachment.builder().mediaType("text/csv").data(new byte[]{5}).build()))
+                .build());
+
+        JsonNode parts = JSON.readTree(captor.getValue().jsonBody()).path("messages").get(0).path("content");
+        assertThat(parts).hasSize(4);
+        assertThat(parts.get(0).path("type").asText()).isEqualTo("text");
+        assertThat(parts.get(1).path("type").asText()).isEqualTo("image_url");
+        assertThat(parts.get(2).path("type").asText()).isEqualTo("file");
+        assertThat(parts.get(2).path("file").path("filename").asText()).isEqualTo("report.pdf");
+        assertThat(parts.get(2).path("file").path("file_data").asText()).isEqualTo("data:application/pdf;base64,AQID");
+        assertThat(parts.get(3).path("file").path("filename").asText()).isEqualTo("document-2");
+        assertThat(parts.get(3).path("file").path("file_data").asText()).startsWith("data:text/csv;base64,");
+    }
+
+    @Test
+    void nvidiaSendsDocumentsAsOpenAiFileParts() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        new NvidiaAdapter("key", transport).send("some-vision-model", Request.builder()
+                .prompt("read this")
+                .attachments(List.of(Attachment.builder().mediaType("application/pdf").data(new byte[]{1, 2, 3}).build()))
+                .build());
+
+        JsonNode part = JSON.readTree(captor.getValue().jsonBody()).path("messages").get(0).path("content").get(1);
+        assertThat(part.path("type").asText()).isEqualTo("file");
+        assertThat(part.path("file").path("file_data").asText()).isEqualTo("data:application/pdf;base64,AQID");
+    }
+
+    @Test
+    void reasoningEffortIsSentAsReasoningEffortByDefaultAndAsAReasoningObjectToOpenRouter() throws Exception {
+        ArgumentCaptor<HttpRequestRecord> captor = ArgumentCaptor.forClass(HttpRequestRecord.class);
+        when(transport.send(captor.capture())).thenReturn(textResponse("ok", 1, 1));
+
+        new NvidiaAdapter("key", transport).send("m", Request.builder().prompt("p").reasoningEffort("high").build());
+        assertThat(JSON.readTree(captor.getValue().jsonBody()).path("reasoning_effort").asText()).isEqualTo("high");
+
+        new OpenRouterAdapter("key", transport).send("m", Request.builder().prompt("p").reasoningEffort("low").build());
+        JsonNode body = JSON.readTree(captor.getValue().jsonBody());
+        assertThat(body.path("reasoning").path("effort").asText()).isEqualTo("low");
+        assertThat(body.has("reasoning_effort")).isFalse();
+
+        new OpenRouterAdapter("key", transport).send("m", Request.builder().prompt("p").reasoningBudgetTokens(2048).build());
+        assertThat(JSON.readTree(captor.getValue().jsonBody()).path("reasoning").path("max_tokens").asInt()).isEqualTo(2048);
+
+        new NvidiaAdapter("key", transport).send("m", Request.builder().prompt("p").build());
+        body = JSON.readTree(captor.getValue().jsonBody());
+        assertThat(body.has("reasoning_effort")).isFalse();
+        assertThat(body.has("reasoning")).isFalse();
+    }
+
+    @Test
+    void transportDefaultStreamingReplaysABufferedBodyLineByLine() {
+        HttpTransport buffered = request -> new HttpResponseRecord(200, "data: one\n\ndata: two\n");
+        HttpTransport failing = request -> new HttpResponseRecord(500, "boom");
+        List<String> lines = new ArrayList<>();
+
+        HttpResponseRecord ok = buffered.sendStreaming(new HttpRequestRecord("u", Map.of(), "{}"), lines::add);
+        HttpResponseRecord error = failing.sendStreaming(new HttpRequestRecord("u", Map.of(), "{}"), lines::add);
+
+        assertThat(lines).containsExactly("data: one", "", "data: two");
+        assertThat(ok.statusCode()).isEqualTo(200);
+        assertThat(error.statusCode()).isEqualTo(500);
+        assertThat(error.body()).isEqualTo("boom");
+    }
+
+    @Test
+    void aResponseWithoutCitationsHasAnEmptyList() throws Exception {
+        when(transport.send(any())).thenReturn(textResponse("plain answer", 1, 1));
+
+        Response response = new NvidiaAdapter("key", transport).send("some-model", Request.builder().prompt("q").build());
+
+        assertThat(response.getCitations()).isEmpty();
+    }
+
+    @Test
+    void readsCachedAndReasoningTokensWhenTheProviderSendsThem() {
+        when(transport.send(any())).thenReturn(new HttpResponseRecord(200, """
+                {
+                  "choices": [{"message": {"content": "ok"}}],
+                  "usage": {"prompt_tokens": 3000, "completion_tokens": 400,
+                            "prompt_tokens_details": {"cached_tokens": 2048, "cache_write_tokens": 512},
+                            "completion_tokens_details": {"reasoning_tokens": 250}}
+                }
+                """));
+
+        Response response = new OpenRouterAdapter("key", transport).send("some/model", Request.builder().prompt("hi").build());
+
+        assertThat(response.getUsage().getInputTokens()).isEqualTo(3000);
+        assertThat(response.getUsage().getCacheReadTokens()).isEqualTo(2048);
+        assertThat(response.getUsage().getCacheWriteTokens()).isEqualTo(512);
+        assertThat(response.getUsage().getReasoningTokens()).isEqualTo(250);
+    }
+
+    @Test
+    void usageWithoutDetailsReportsNoCachedOrReasoningTokens() {
+        when(transport.send(any())).thenReturn(new HttpResponseRecord(200, """
+                {"choices": [{"message": {"content": "ok"}}], "usage": {"prompt_tokens": 8, "completion_tokens": 4}}
+                """));
+
+        Response response = new NvidiaAdapter("key", transport).send("some-model", Request.builder().prompt("hi").build());
+
+        assertThat(response.getUsage().getCacheReadTokens()).isZero();
+        assertThat(response.getUsage().getCacheWriteTokens()).isZero();
+        assertThat(response.getUsage().getReasoningTokens()).isZero();
+    }
+
+    @Test
+    void sendMapsToolCallsFromResponse() {
+        when(transport.send(any())).thenReturn(new HttpResponseRecord(200, """
+                {
+                  "choices": [{"message": {"content": null, "tool_calls": [
+                    {"id": "call_1", "function": {"name": "lookup", "arguments": "{\\"query\\":\\"weather\\"}"}}
+                  ]}}],
+                  "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+                }
+                """));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        Response response = adapter.send("some-model", Request.builder().prompt("lookup something").build());
+
+        assertThat(response.getToolCalls()).hasSize(1);
+        assertThat(response.getToolCalls().get(0).getName()).isEqualTo("lookup");
+        assertThat(response.getToolCalls().get(0).getArguments()).containsEntry("query", "weather");
+    }
+
+    @Test
+    void nonSuccessStatusThrowsProviderHttpException() {
+        when(transport.send(any())).thenReturn(new HttpResponseRecord(429, "{\"error\":\"rate limited\"}"));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+
+        assertThatThrownBy(() -> adapter.send("some-model", Request.builder().prompt("hi").build()))
+                .isInstanceOf(ProviderHttpException.class)
+                .satisfies(e -> assertThat(((ProviderHttpException) e).statusCode()).isEqualTo(429));
+    }
+
+    @Test
+    void sendAsyncDelegatesToTransportSendAsync() {
+        when(transport.sendAsync(any())).thenReturn(CompletableFuture.completedFuture(textResponse("async result", 1, 1)));
+
+        NvidiaAdapter adapter = new NvidiaAdapter("key", transport);
+        CompletableFuture<Response> future = adapter.sendAsync("some-model", Request.builder().prompt("hi").build());
+
+        assertThat(future.join().getContent()).isEqualTo("async result");
+    }
+
+    @Test
+    void theOtherCompatibleAdaptersHaveTheirOwnProviderIdAndEndpoint() {
+        assertThat(new NvidiaAdapter("k", transport).id()).isEqualTo(Provider.NVIDIA);
+        assertThat(new HuggingFaceAdapter("k", transport).id()).isEqualTo(Provider.HUGGINGFACE);
+        assertThat(new OpenRouterAdapter("k", transport).id()).isEqualTo(Provider.OPENROUTER);
+
+        when(transport.send(any())).thenReturn(textResponse("ok", 1, 1));
+        new NvidiaAdapter("k", transport).send("m", Request.builder().prompt("hi").build());
+        new HuggingFaceAdapter("k", transport).send("m", Request.builder().prompt("hi").build());
+        new OpenRouterAdapter("k", transport).send("m", Request.builder().prompt("hi").build());
+    }
+
+    private static HttpResponseRecord textResponse(String content, int inputTokens, int outputTokens) {
+        String body = """
+                {
+                  "choices": [{"message": {"content": "%s", "tool_calls": []}}],
+                  "usage": {"prompt_tokens": %d, "completion_tokens": %d}
+                }
+                """.formatted(content, inputTokens, outputTokens);
+        return new HttpResponseRecord(200, body);
+    }
+}

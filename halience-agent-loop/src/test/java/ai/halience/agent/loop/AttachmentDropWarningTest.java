@@ -1,0 +1,105 @@
+package ai.halience.agent.loop;
+
+import ai.halience.llm.router.capability.ModelCapabilityTable;
+import ai.halience.llm.router.capability.ModelEntry;
+import ai.halience.llm.router.config.RouteEntry;
+import ai.halience.llm.router.config.RouterConfig;
+import ai.halience.llm.router.provider.Provider;
+import ai.halience.agent.loop.workspace.InMemoryWorkspace;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+
+import static ai.halience.agent.loop.ScriptedModel.RECURSIVE;
+import static ai.halience.agent.loop.ScriptedModel.text;
+import static org.assertj.core.api.Assertions.assertThat;
+
+class AttachmentDropWarningTest {
+
+    private static final String TEXT_ONLY = "test-text-only-model";
+    private static final byte[] PNG = {(byte) 0x89, 'P', 'N', 'G'};
+
+    private final ScriptedModel model = new ScriptedModel();
+
+    @BeforeEach
+    void registerTextOnlyModel() {
+        ModelCapabilityTable.registerModel(ModelEntry.builder().provider(Provider.ANTHROPIC).model(TEXT_ONLY)
+                .contextWindowTokens(100_000).maxOutputTokens(4_000).supportsTools(true)
+                .supportsVision(false).supportsFileInput(false).build());
+    }
+
+    @AfterEach
+    void tearDown() {
+        ModelCapabilityTable.removeModel(Provider.ANTHROPIC, TEXT_ONLY);
+        model.close();
+    }
+
+    @Test
+    void aWarningSaysWhenTheModelCouldNotTakeTheAttachments() throws InterruptedException {
+        AgentLoop loop = model.loop().workspace(new InMemoryWorkspace()).build();
+        model.respond(request -> text("I can't see the image."));
+
+        AgentLoopRunSupport.Capture capture = AgentLoopRunSupport.run(loop, LoopRequest.builder()
+                .prompt("What's in this photo?")
+                .scope(Scope.of("acme", "alice", "s1"))
+                .agentProfile(RECURSIVE)
+                .attachments(List.of(InputFile.of("photo.png", PNG)))
+                .routerConfig(RouterConfig.builder().route(List.of(RouteEntry.of(Provider.ANTHROPIC, TEXT_ONLY))).build()));
+
+        assertThat(model.requests.getFirst().getAttachments()).isEmpty();
+        assertThat(capture.messages()).filteredOn(m -> m.type() == MessageType.WARNING)
+                .singleElement()
+                .satisfies(m -> assertThat(m.message()).contains("anthropic/" + TEXT_ONLY, "can't take", "saved in the workspace"));
+    }
+
+    @Test
+    void requiringAttachmentSupportFailsTheRunInsteadOfDroppingThem() throws InterruptedException {
+        AgentLoop loop = model.loop().build();
+        model.respond(request -> text("should not be called"));
+
+        AgentLoopRunSupport.Capture capture = AgentLoopRunSupport.run(loop, LoopRequest.builder()
+                .prompt("What's in this photo?")
+                .agentProfile(RECURSIVE)
+                .requireAttachmentSupport(true)
+                .attachments(List.of(InputFile.of("photo.png", PNG)))
+                .routerConfig(RouterConfig.builder().route(List.of(RouteEntry.of(Provider.ANTHROPIC, TEXT_ONLY))).build()));
+
+        assertThat(capture.result()).isNull();
+        assertThat(capture.error()).isInstanceOf(ai.halience.llm.router.error.RouterExhaustedException.class)
+                .hasMessageContaining(TEXT_ONLY);
+        assertThat(model.requests).isEmpty();
+    }
+
+    @Test
+    void requiringAttachmentSupportStillRoutesToAModelThatCanTakeThem() throws InterruptedException {
+        AgentLoop loop = model.loop().build();
+        model.respond(request -> text("A photo of a cat."));
+
+        AgentLoopRunSupport.Capture capture = AgentLoopRunSupport.run(loop, LoopRequest.builder()
+                .prompt("What's in this photo?")
+                .agentProfile(RECURSIVE)
+                .requireAttachmentSupport(true)
+                .attachments(List.of(InputFile.of("photo.png", PNG)))
+                .routerConfig(RouterConfig.builder().route(List.of(
+                        RouteEntry.of(Provider.ANTHROPIC, TEXT_ONLY), RouteEntry.of(Provider.ANTHROPIC, ScriptedModel.MODEL))).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(model.requests.getFirst().getAttachments()).hasSize(1);
+        assertThat(capture.result().finalResponse().getModelUsed()).isEqualTo(ScriptedModel.MODEL);
+    }
+
+    @Test
+    void noWarningWhenTheModelTakesThem() throws InterruptedException {
+        AgentLoop loop = model.loop().build();
+        model.respond(request -> text("A chart."));
+
+        AgentLoopRunSupport.Capture capture = AgentLoopRunSupport.run(loop, LoopRequest.builder()
+                .prompt("What's this?").agentProfile(RECURSIVE)
+                .attachments(List.of(InputFile.of("photo.png", PNG))));
+
+        assertThat(model.requests.getFirst().getAttachments()).hasSize(1);
+        assertThat(capture.messages()).noneMatch(m -> m.type() == MessageType.WARNING);
+    }
+}

@@ -1,0 +1,475 @@
+package ai.halience.llm.router.provider.compatible;
+
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+
+import tools.jackson.core.JacksonException;
+import tools.jackson.core.type.TypeReference;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import tools.jackson.databind.node.ArrayNode;
+import tools.jackson.databind.node.ObjectNode;
+import ai.halience.llm.router.capability.ModelCapabilityTable;
+import ai.halience.llm.router.capability.ModelEntry;
+import ai.halience.llm.router.model.Attachment;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+import ai.halience.llm.router.model.Role;
+import ai.halience.llm.router.model.ToolCall;
+import ai.halience.llm.router.model.ToolDefinition;
+import ai.halience.llm.router.model.Usage;
+import ai.halience.llm.router.provider.ProviderAdapter;
+import ai.halience.llm.router.provider.compatible.HttpTransport.HttpRequestRecord;
+import ai.halience.llm.router.provider.compatible.HttpTransport.HttpResponseRecord;
+
+/**
+ * Shared base for providers with no official Java SDK that expose an OpenAI-compatible
+ * chat/completions HTTP endpoint (NVIDIA NIM, Hugging Face, OpenRouter) — see
+ * {@code MODEL_CAPABILITY_HEURISTICS.md}'s scoping notes and this project's implementation plan
+ * for why raw HTTP was chosen over borrowing the official OpenAI SDK against a foreign vendor's
+ * API. Subclasses supply only the endpoint URL and, if needed, a non-default auth header shape.
+ *
+ * <p>Known scope limits (documented rather than silently guessed at): the unified
+ * {@code Message} history shape (§3) carries no tool-call id, so a {@code TOOL}-role history
+ * entry is sent as a plain user-role message; {@code image/*} attachments are mapped to the
+ * {@code image_url} content-part convention shared by every OpenAI-compatible API, and every other
+ * attachment the router leaves in the request (it drops what the model's capability-table row
+ * doesn't accept, §4) goes as a document part — OpenAI's {@code file} part by default, or the
+ * provider's own shape via {@link #documentPart}; {@code Response.generatedFiles} is
+ * always left empty, since none of these providers document a file-generation mechanism.
+ * Unlike {@code AnthropicAdapter}/{@code OpenAiAdapter}, attachments here are always re-embedded
+ * inline on every call — none of these vendors' OpenAI-compatible endpoints share a common,
+ * documented file-upload-and-reference convention this shared base could target generically, so
+ * no attempt is made to deduplicate repeated attachment content across calls for them.
+ */
+public abstract class OpenAiCompatibleHttpAdapter implements ProviderAdapter {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final long DEFAULT_MAX_TOKENS = 4096L;
+
+    private final String apiKey;
+    private final HttpTransport transport;
+
+    protected OpenAiCompatibleHttpAdapter(String apiKey) {
+        this(apiKey, new JdkHttpTransport());
+    }
+
+    protected OpenAiCompatibleHttpAdapter(String apiKey, HttpTransport transport) {
+        this.apiKey = (apiKey == null || apiKey.isBlank()) ? null : apiKey;
+        this.transport = Objects.requireNonNull(transport, "transport must not be null");
+    }
+
+    /** Full URL of this provider's OpenAI-compatible chat/completions endpoint. */
+    protected abstract String chatCompletionsUrl();
+
+    /** Auth header(s) to send, given the resolved API key. Default: {@code Authorization: Bearer <key>}. */
+    protected Map<String, String> authHeaders(String resolvedApiKey) {
+        return Map.of("Authorization", "Bearer " + resolvedApiKey);
+    }
+
+    @Override
+    public boolean isAvailable() {
+        return apiKey != null;
+    }
+
+    @Override
+    public Response send(String model, Request adaptedRequest) {
+        requireAvailable();
+        return parseResponse(transport.send(buildHttpRequest(model, adaptedRequest)));
+    }
+
+    @Override
+    public CompletableFuture<Response> sendAsync(String model, Request adaptedRequest) {
+        requireAvailable();
+        return transport.sendAsync(buildHttpRequest(model, adaptedRequest)).thenApply(this::parseResponse);
+    }
+
+    private void requireAvailable() {
+        if (apiKey == null) {
+            throw new IllegalStateException(getClass().getSimpleName() + " has no credentials configured");
+        }
+    }
+
+    /**
+     * Streams the chat completion as server-sent events: each text delta goes to {@code onText}
+     * as it arrives, while tool-call fragments and usage are accumulated into the same response
+     * fragment {@link #send} would return. {@code original} holds every streamed chunk, in order.
+     */
+    @Override
+    public Response sendStreaming(String model, Request adaptedRequest, Consumer<String> onText) {
+        requireAvailable();
+        ObjectNode body = buildBody(model, adaptedRequest);
+        body.put("stream", true);
+        if (requestsStreamUsage()) {
+            body.putObject("stream_options").put("include_usage", true);
+        }
+        StreamAccumulator accumulator = new StreamAccumulator(onText);
+        HttpResponseRecord status = transport.sendStreaming(toHttpRequest(body), accumulator::acceptLine);
+        if (status.statusCode() >= 300) {
+            throw new ProviderHttpException(status.statusCode(), status.body(), status.retryAfter());
+        }
+        return accumulator.toResponse();
+    }
+
+    /**
+     * Whether a streaming request should ask for token usage in the final chunk via the
+     * OpenAI-standard {@code stream_options: {"include_usage": true}}. On by default; a provider
+     * that doesn't document the option overrides this to {@code false}, and its usage is then
+     * taken from whatever chunk reports it, or left at zero if none does.
+     */
+    protected boolean requestsStreamUsage() {
+        return true;
+    }
+
+    private HttpRequestRecord buildHttpRequest(String model, Request request) {
+        return toHttpRequest(buildBody(model, request));
+    }
+
+    private HttpRequestRecord toHttpRequest(ObjectNode body) {
+        Map<String, String> headers = new LinkedHashMap<>(authHeaders(apiKey));
+        headers.put("Content-Type", "application/json");
+        return new HttpRequestRecord(chatCompletionsUrl(), headers, body.toString());
+    }
+
+    private ObjectNode buildBody(String model, Request request) {
+        ObjectNode body = MAPPER.createObjectNode();
+        body.put("model", model);
+        body.set("messages", buildMessages(request));
+        body.put("max_tokens", resolveMaxTokens(model, request));
+
+        if (request.getTemperature() != null) {
+            body.put("temperature", request.getTemperature());
+        }
+        if (request.getReasoningEffort() != null || request.getReasoningBudgetTokens() != null) {
+            applyReasoning(body, request.getReasoningEffort(), request.getReasoningBudgetTokens());
+        }
+        if (request.getTopP() != null) {
+            body.put("top_p", request.getTopP());
+        }
+
+        if (!request.getTools().isEmpty()) {
+            body.set("tools", buildTools(request.getTools()));
+        }
+        if (request.getResponseSchema() != null) {
+            body.set("response_format", buildResponseFormat(request.getResponseSchema()));
+        }
+
+        return body;
+    }
+
+    /**
+     * Adds the negotiated reasoning control (§7.4) to the request body: by default OpenAI's
+     * top-level {@code reasoning_effort}. A thinking budget has no common OpenAI-compatible
+     * convention, so the default sends none; a provider with one overrides this.
+     *
+     * @param effort the provider's effort value, or {@code null}
+     * @param budgetTokens the thinking budget, or {@code null}
+     */
+    protected void applyReasoning(ObjectNode body, String effort, Integer budgetTokens) {
+        if (effort != null) {
+            body.put("reasoning_effort", effort);
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private ArrayNode buildMessages(Request request) {
+        ArrayNode messages = MAPPER.createArrayNode();
+
+        String system = buildSystemInstructions(request);
+        if (system != null) {
+            messages.add(simpleMessage("system", system));
+        }
+
+        for (var message : request.getHistory()) {
+            switch (message.getRole()) {
+                case USER -> messages.add(userMessage(message.getContent(), message.getAttachments()));
+                case ASSISTANT -> messages.add(simpleMessage("assistant", message.getContent()));
+                case SYSTEM -> { /* folded into system instructions above */ }
+                case TOOL -> messages.add(simpleMessage("user", "Tool result: " + message.getContent()));
+            }
+        }
+
+        messages.add(userMessage(request.getPrompt(), request.getAttachments()));
+
+        return messages;
+    }
+
+    /** A user message: plain text, or its text, images and (unless switched off) documents as content parts. */
+    @SuppressWarnings("deprecation")
+    private ObjectNode userMessage(String text, List<Attachment> attachments) {
+        List<Attachment> imageAttachments = attachments.stream()
+                .filter(OpenAiCompatibleHttpAdapter::isImage)
+                .toList();
+        List<Attachment> documentAttachments = supportsDocumentAttachments()
+                ? attachments.stream().filter(a -> !isImage(a)).toList()
+                : List.of();
+        return imageAttachments.isEmpty() && documentAttachments.isEmpty()
+                ? simpleMessage("user", text)
+                : userMessageWithAttachments(text, imageAttachments, documentAttachments);
+    }
+
+    /**
+     * Whether non-image attachments are sent at all. On by default: the router has already dropped
+     * any the model's capability-table row doesn't accept (§4), so what's left is meant to be sent.
+     *
+     * @deprecated document support is decided per model by the capability table's
+     *             {@code inputMediaTypes}; override {@link #documentPart} to change the wire shape.
+     */
+    @Deprecated
+    protected boolean supportsDocumentAttachments() {
+        return true;
+    }
+
+    /**
+     * The content part for one non-image attachment ({@code position} counts documents from 1, for
+     * a default filename). Default: OpenAI's {@code {"type": "file", "file": {"filename",
+     * "file_data": "data:<type>;base64,..."}}}, which OpenRouter also takes.
+     */
+    protected ObjectNode documentPart(Attachment document, int position) {
+        ObjectNode filePart = MAPPER.createObjectNode();
+        filePart.put("type", "file");
+        ObjectNode file = filePart.putObject("file");
+        file.put("filename", document.getFilename() != null ? document.getFilename() : "document-" + position);
+        String base64Data = Base64.getEncoder().encodeToString(document.getData());
+        file.put("file_data", "data:" + document.getMediaType() + ";base64," + base64Data);
+        return filePart;
+    }
+
+    private static boolean isImage(Attachment attachment) {
+        return attachment.getMediaType() != null && attachment.getMediaType().startsWith("image/");
+    }
+
+    private static String buildSystemInstructions(Request request) {
+        StringBuilder combined = new StringBuilder();
+        if (request.getSystemInstructions() != null && !request.getSystemInstructions().isBlank()) {
+            combined.append(request.getSystemInstructions());
+        }
+        for (var message : request.getHistory()) {
+            if (message.getRole() == Role.SYSTEM) {
+                if (combined.length() > 0) {
+                    combined.append("\n\n");
+                }
+                combined.append(message.getContent());
+            }
+        }
+        return combined.length() == 0 ? null : combined.toString();
+    }
+
+    private ObjectNode simpleMessage(String role, String content) {
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("role", role);
+        node.put("content", content);
+        return node;
+    }
+
+    private ObjectNode userMessageWithAttachments(String prompt, List<Attachment> images, List<Attachment> documents) {
+        ObjectNode node = MAPPER.createObjectNode();
+        node.put("role", "user");
+        ArrayNode parts = node.putArray("content");
+
+        ObjectNode textPart = MAPPER.createObjectNode();
+        textPart.put("type", "text");
+        textPart.put("text", prompt);
+        parts.add(textPart);
+
+        for (Attachment image : images) {
+            ObjectNode imagePart = MAPPER.createObjectNode();
+            imagePart.put("type", "image_url");
+            ObjectNode imageUrl = imagePart.putObject("image_url");
+            String base64Data = Base64.getEncoder().encodeToString(image.getData());
+            imageUrl.put("url", "data:" + image.getMediaType() + ";base64," + base64Data);
+            parts.add(imagePart);
+        }
+
+        for (int i = 0; i < documents.size(); i++) {
+            parts.add(documentPart(documents.get(i), i + 1));
+        }
+
+        return node;
+    }
+
+    private ArrayNode buildTools(List<ToolDefinition> tools) {
+        ArrayNode toolsNode = MAPPER.createArrayNode();
+        for (ToolDefinition tool : tools) {
+            ObjectNode toolNode = MAPPER.createObjectNode();
+            toolNode.put("type", "function");
+            ObjectNode function = toolNode.putObject("function");
+            function.put("name", tool.getName());
+            function.put("description", tool.getDescription());
+            function.set("parameters", MAPPER.valueToTree(tool.getParameters()));
+            toolsNode.add(toolNode);
+        }
+        return toolsNode;
+    }
+
+    /** The schema as given, without {@code strict} — see {@code OpenAiAdapter.toJsonSchema} for why. */
+    private ObjectNode buildResponseFormat(Map<String, Object> responseSchema) {
+        ObjectNode format = MAPPER.createObjectNode();
+        format.put("type", "json_schema");
+        ObjectNode jsonSchema = format.putObject("json_schema");
+        jsonSchema.put("name", "response");
+        jsonSchema.set("schema", MAPPER.valueToTree(responseSchema));
+        return format;
+    }
+
+    /** The model's maximum output, or the request's {@code maxOutputTokens} when that's lower. */
+    private long resolveMaxTokens(String model, Request request) {
+        long modelMax = ModelCapabilityTable.findModel(id(), model)
+                .map(ModelEntry::getMaxOutputTokens)
+                .map(Integer::longValue)
+                .orElse(DEFAULT_MAX_TOKENS);
+        return request.getMaxOutputTokens() == null ? modelMax : Math.min(modelMax, request.getMaxOutputTokens());
+    }
+
+    /**
+     * An OpenAI-shaped {@code usage} object, with the optional {@code prompt_tokens_details}
+     * ({@code cached_tokens}, and OpenRouter's {@code cache_write_tokens}) and
+     * {@code completion_tokens_details.reasoning_tokens} read when the provider sends them.
+     */
+    static Usage parseUsage(JsonNode usage) {
+        JsonNode promptDetails = usage.path("prompt_tokens_details");
+        return Usage.builder()
+                .inputTokens(usage.path("prompt_tokens").asInt(0))
+                .outputTokens(usage.path("completion_tokens").asInt(0))
+                .reasoningTokens(usage.path("completion_tokens_details").path("reasoning_tokens").asInt(0))
+                .cacheReadTokens(promptDetails.path("cached_tokens").asInt(0))
+                .cacheWriteTokens(promptDetails.path("cache_write_tokens").asInt(0))
+                .estimatedCostUsdCents(0) // finalized by the router core against the capability table
+                .build();
+    }
+
+    private Response parseResponse(HttpResponseRecord httpResponse) {
+        if (httpResponse.statusCode() >= 300) {
+            throw new ProviderHttpException(httpResponse.statusCode(), httpResponse.body(), httpResponse.retryAfter());
+        }
+
+        JsonNode root = readTree(httpResponse.body());
+        JsonNode message = root.path("choices").path(0).path("message");
+
+        return Response.builder()
+                .content(message.path("content").asText(""))
+                .toolCalls(parseToolCalls(message.path("tool_calls")))
+                .usage(parseUsage(root.path("usage")))
+                .original(root)
+                .build();
+    }
+
+    /**
+     * Folds a chat-completions SSE stream back into one response: {@code data:} lines carry JSON
+     * chunks, {@code data: [DONE]} ends the stream, and anything else (blank separators, {@code :}
+     * keep-alive comments) is ignored. Tool calls arrive as fragments keyed by {@code index}, with
+     * the id and name in the first fragment and the arguments JSON split across the rest.
+     */
+    private final class StreamAccumulator {
+
+        private final Consumer<String> onText;
+        private final StringBuilder content = new StringBuilder();
+        private final Map<Integer, StreamedToolCall> toolCalls = new TreeMap<>();
+        private final ArrayNode chunks = MAPPER.createArrayNode();
+        private JsonNode usage = MAPPER.missingNode();
+
+        StreamAccumulator(Consumer<String> onText) {
+            this.onText = onText;
+        }
+
+        void acceptLine(String line) {
+            if (!line.startsWith("data:")) {
+                return;
+            }
+            String data = line.substring("data:".length()).trim();
+            if (data.isEmpty() || data.equals("[DONE]")) {
+                return;
+            }
+            JsonNode chunk = readTree(data);
+            chunks.add(chunk);
+            if (chunk.has("error")) {
+                throw new IllegalStateException("Provider reported an error mid-stream: " + chunk.path("error"));
+            }
+            if (chunk.path("usage").isObject()) {
+                usage = chunk.path("usage");
+            }
+            JsonNode delta = chunk.path("choices").path(0).path("delta");
+            String text = delta.path("content").asText("");
+            if (!text.isEmpty()) {
+                content.append(text);
+                onText.accept(text);
+            }
+            for (JsonNode fragment : delta.path("tool_calls")) {
+                toolCalls.computeIfAbsent(fragment.path("index").asInt(toolCalls.size()), i -> new StreamedToolCall())
+                        .accept(fragment);
+            }
+        }
+
+        Response toResponse() {
+            return Response.builder()
+                    .content(content.toString())
+                    .toolCalls(toolCalls.values().stream().map(StreamedToolCall::toToolCall).toList())
+                    .usage(parseUsage(usage))
+                    .original(chunks)
+                    .build();
+        }
+    }
+
+    private final class StreamedToolCall {
+
+        private String id;
+        private String name;
+        private final StringBuilder arguments = new StringBuilder();
+
+        void accept(JsonNode fragment) {
+            if (fragment.hasNonNull("id")) {
+                id = fragment.path("id").asText();
+            }
+            JsonNode function = fragment.path("function");
+            if (function.hasNonNull("name")) {
+                name = function.path("name").asText();
+            }
+            arguments.append(function.path("arguments").asText(""));
+        }
+
+        ToolCall toToolCall() {
+            return ToolCall.builder()
+                    .id(id)
+                    .name(name)
+                    .arguments(parseArguments(arguments.isEmpty() ? "{}" : arguments.toString()))
+                    .build();
+        }
+    }
+
+    private List<ToolCall> parseToolCalls(JsonNode toolCallsNode) {
+        List<ToolCall> toolCalls = new ArrayList<>();
+        for (JsonNode toolCallNode : toolCallsNode) {
+            JsonNode function = toolCallNode.path("function");
+            toolCalls.add(ToolCall.builder()
+                    .id(toolCallNode.path("id").asText(null))
+                    .name(function.path("name").asText(null))
+                    .arguments(parseArguments(function.path("arguments").asText("{}")))
+                    .build());
+        }
+        return toolCalls;
+    }
+
+    private Map<String, Object> parseArguments(String argumentsJson) {
+        try {
+            return MAPPER.readValue(argumentsJson, new TypeReference<Map<String, Object>>() {
+            });
+        } catch (JacksonException e) {
+            return Map.of();
+        }
+    }
+
+    private JsonNode readTree(String json) {
+        try {
+            return MAPPER.readTree(json);
+        } catch (JacksonException e) {
+            throw new IllegalStateException("Provider returned malformed JSON: " + e.getMessage(), e);
+        }
+    }
+}

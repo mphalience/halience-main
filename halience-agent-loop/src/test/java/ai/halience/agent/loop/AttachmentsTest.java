@@ -1,0 +1,156 @@
+package ai.halience.agent.loop;
+
+import ai.halience.llm.router.model.Attachment;
+import ai.halience.llm.router.model.Message;
+import ai.halience.llm.router.model.Request;
+import ai.halience.agent.loop.tool.ToolRegistry;
+import ai.halience.agent.loop.tool.builtin.WorkspaceTools;
+import ai.halience.agent.loop.workspace.InMemoryWorkspace;
+import ai.halience.agent.loop.workspace.WorkspaceLimits;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+
+import static ai.halience.agent.loop.ScriptedModel.RECURSIVE;
+import static ai.halience.agent.loop.ScriptedModel.complete;
+import static ai.halience.agent.loop.ScriptedModel.lastToolResult;
+import static ai.halience.agent.loop.ScriptedModel.toolCall;
+import static org.assertj.core.api.Assertions.assertThat;
+
+class AttachmentsTest {
+
+    private static final Scope ALICE = Scope.of("acme", "alice", "s1");
+    private static final byte[] PNG = {(byte) 0x89, 'P', 'N', 'G', 1, 2, 3};
+
+    private final ScriptedModel model = new ScriptedModel();
+    private final InMemoryWorkspace workspace = new InMemoryWorkspace();
+
+    @AfterEach
+    void tearDown() {
+        model.close();
+    }
+
+    @Test
+    void imagesAndPdfsGoToTheModelDirectlyTextIsInlinedAndEverythingIsSaved() {
+        AgentLoop loop = model.loop().workspace(workspace).build();
+
+        AgentLoopResult result = loop.runAndWait(request()
+                .attachments(List.of(
+                        InputFile.of("receipt.png", PNG),
+                        InputFile.of("contract.pdf", "%PDF-1.7".getBytes()),
+                        InputFile.of("sales.csv", "region,amount\nNorth,10".getBytes()),
+                        InputFile.of("model.xlsx", new byte[]{1, 2}))));
+
+        Request sent = model.requests.getFirst();
+        assertThat(sent.getAttachments()).extracting(Attachment::getFilename).containsExactly("receipt.png", "contract.pdf");
+        String note = note(sent);
+        assertThat(note).contains("4 file(s)",
+                "receipt.png (image/png, 7 bytes), saved in the workspace at uploads/receipt.png — attached for you to see directly",
+                "sales.csv (text/csv, 22 bytes), saved in the workspace at uploads/sales.csv:\n[[untrusted-content ",
+                "source=attachment sales.csv]]\n```\nregion,amount\nNorth,10\n```\n[[end untrusted-content ",
+                "model.xlsx", "uploads/model.xlsx");
+        assertThat(result.changedFiles()).containsExactly(
+                "uploads/receipt.png", "uploads/contract.pdf", "uploads/sales.csv", "uploads/model.xlsx");
+        assertThat(workspace.scopedTo(ALICE.atLevel(ScopeLevel.USER), WorkspaceLimits.DEFAULT).require("uploads/sales.csv").text())
+                .isEqualTo("region,amount\nNorth,10");
+    }
+
+    @Test
+    void savingCanBeTurnedOff() {
+        AgentLoop loop = model.loop().workspace(workspace).build();
+
+        AgentLoopResult result = loop.runAndWait(request()
+                .saveAttachments(false)
+                .attachments(List.of(InputFile.of("notes.txt", "hello".getBytes()), InputFile.of("photo.png", PNG))));
+
+        assertThat(result.changedFiles()).isEmpty();
+        assertThat(note(model.requests.getFirst())).contains("notes.txt (text/plain, 5 bytes):\n[[untrusted-content", "```\nhello\n```")
+                .doesNotContain("saved in the workspace");
+        assertThat(model.requests.getFirst().getAttachments()).hasSize(1);
+    }
+
+    @Test
+    void withoutAWorkspaceAttachmentsStillReachTheModel() {
+        AgentLoop loop = model.loop().build();
+
+        AgentLoopResult result = loop.runAndWait(request().attachments(List.of(InputFile.of("photo.png", PNG))));
+
+        assertThat(result.changedFiles()).isEmpty();
+        assertThat(model.requests.getFirst().getAttachments()).hasSize(1);
+    }
+
+    @Test
+    void uploadNamesCannotEscapeTheUploadsFolder() {
+        AgentLoop loop = model.loop().workspace(workspace).build();
+
+        AgentLoopResult result = loop.runAndWait(request().attachments(List.of(
+                InputFile.of("../../etc/passwd.txt", "x".getBytes()),
+                InputFile.of("C:\\Users\\me\\report.txt", "y".getBytes()))));
+
+        assertThat(result.changedFiles()).containsExactly("uploads/passwd.txt", "uploads/report.txt");
+    }
+
+    @Test
+    void attachmentsAreSeenOnEveryStepOfTheRun() {
+        AgentLoop loop = model.loop().workspace(workspace)
+                .tools(new ToolRegistry().registerAll(WorkspaceTools.all())).build();
+        model.respond(request -> lastToolResult(request) == null
+                ? toolCall("l", "workspace_list", Map.of())
+                : complete("done"));
+
+        loop.runAndWait(request().attachments(List.of(InputFile.of("photo.png", PNG))));
+
+        assertThat(model.requests).hasSize(2).allSatisfy(r -> assertThat(r.everyAttachment()).hasSize(1));
+        assertThat(model.requests.get(1).getAttachments()).as("not sent again with the prompt").isEmpty();
+        assertThat(model.requests.get(1).getHistory().getFirst().getAttachments()).as("but with the goal, in the conversation")
+                .hasSize(1);
+    }
+
+    @Test
+    void workspaceViewShowsAFileToTheModelFromTheNextStepOn() {
+        workspace.scopedTo(ALICE.atLevel(ScopeLevel.USER), WorkspaceLimits.DEFAULT).write("charts/q3.png", PNG, null);
+        AgentLoop loop = model.loop().workspace(workspace)
+                .tools(new ToolRegistry().registerAll(WorkspaceTools.all())).build();
+        model.respond(request -> lastToolResult(request) == null
+                ? toolCall("v", "workspace_view", Map.of("path", "charts/q3.png"))
+                : complete("It's a bar chart."));
+
+        AgentLoopResult result = loop.runAndWait(request());
+
+        assertThat(model.requests.get(0).everyAttachment()).isEmpty();
+        assertThat(model.requests.get(1).everyAttachment()).extracting(Attachment::getFilename).containsExactly("charts/q3.png");
+        assertThat(model.requests.get(1).getHistory().getLast().getAttachments()).as("in a message after the tool result")
+                .extracting(Attachment::getFilename).containsExactly("charts/q3.png");
+        assertThat(lastToolResult(model.requests.get(1))).isEqualTo("You can now see charts/q3.png directly.");
+        assertThat(result.finalResponse().getContent()).isEqualTo("It's a bar chart.");
+    }
+
+    @Test
+    void workspaceViewRefusesFilesItCannotShow() {
+        workspace.scopedTo(ALICE.atLevel(ScopeLevel.USER), WorkspaceLimits.DEFAULT).writeText("notes.md", "hi");
+        AgentLoop loop = model.loop().workspace(workspace)
+                .tools(new ToolRegistry().registerAll(WorkspaceTools.all())).build();
+        model.respond(request -> lastToolResult(request) == null
+                ? toolCall("v", "workspace_view", Map.of("path", "notes.md"))
+                : complete("ok"));
+
+        loop.runAndWait(request());
+
+        assertThat(lastToolResult(model.requests.get(1))).startsWith("Error: notes.md is text/markdown; only images and PDFs");
+        assertThat(model.requests.get(1).everyAttachment()).isEmpty();
+    }
+
+    private static LoopRequest.LoopRequestBuilder request() {
+        return LoopRequest.builder().prompt("Take a look").scope(ALICE).agentProfile(RECURSIVE);
+    }
+
+    /** The note describing the attachments: with the goal, in the first call's prompt (never a system turn). */
+    private static String note(Request request) {
+        assertThat(request.getHistory()).noneMatch(m -> m.getContent().contains("The user attached"));
+        int at = request.getPrompt().indexOf("The user attached");
+        assertThat(at).isPositive();
+        return request.getPrompt().substring(at);
+    }
+}

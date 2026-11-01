@@ -1,0 +1,451 @@
+package ai.halience.llm.router.provider.anthropic;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.time.OffsetDateTime;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.AnthropicClientAsync;
+import com.anthropic.models.files.FileMetadata;
+import com.anthropic.models.files.FileUploadParams;
+import com.anthropic.models.messages.ContentBlock;
+import com.anthropic.models.messages.ContentBlockParam;
+import com.anthropic.models.messages.DocumentBlockParam;
+import com.anthropic.models.messages.ImageBlockParam;
+import com.anthropic.models.messages.Message;
+import com.anthropic.models.messages.MessageCreateParams;
+import com.anthropic.models.messages.OutputConfig;
+import com.anthropic.models.messages.MessageParam;
+import com.anthropic.models.messages.TextBlock;
+import com.anthropic.models.messages.ToolUseBlock;
+import com.anthropic.models.messages.Usage;
+import com.anthropic.services.async.MessageServiceAsync;
+import com.anthropic.services.blocking.FileService;
+import com.anthropic.services.blocking.MessageService;
+import ai.halience.llm.router.capability.ModelCapabilityTable;
+import ai.halience.llm.router.model.Attachment;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+import ai.halience.llm.router.model.ToolCall;
+import ai.halience.llm.router.provider.Provider;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+@ExtendWith(MockitoExtension.class)
+class AnthropicAdapterTest {
+
+    @Mock
+    private AnthropicClient client;
+    @Mock
+    private MessageService messageService;
+    @Mock
+    private FileService fileService;
+    @Mock
+    private AnthropicClientAsync asyncClient;
+    @Mock
+    private MessageServiceAsync asyncMessageService;
+
+    @Test
+    void idAndAvailability() {
+        assertThat(new AnthropicAdapter(client).id()).isEqualTo(Provider.ANTHROPIC);
+        assertThat(new AnthropicAdapter(client).isAvailable()).isTrue();
+        assertThat(new AnthropicAdapter((String) null).isAvailable()).isFalse();
+        assertThat(new AnthropicAdapter("").isAvailable()).isFalse();
+    }
+
+    @Test
+    void sendMapsRequestAndParsesTextResponse() {
+        when(client.messages()).thenReturn(messageService);
+        when(messageService.create(any(MessageCreateParams.class))).thenReturn(textMessage("Hello there"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        Response response = adapter.send("claude-opus-5-5", Request.builder().prompt("Hi").build());
+
+        assertThat(response.getContent()).isEqualTo("Hello there");
+        assertThat(response.getToolCalls()).isEmpty();
+        assertThat(response.getUsage().getInputTokens()).isEqualTo(10);
+        assertThat(response.getUsage().getOutputTokens()).isEqualTo(5);
+        assertThat(response.getOriginal()).isInstanceOf(Message.class);
+    }
+
+    @Test
+    void sendSendsSystemInstructionsAndPrompt() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder()
+                .prompt("What's the weather?")
+                .systemInstructions("You are terse.")
+                .build());
+
+        MessageCreateParams sent = captor.getValue();
+        assertThat(sent.model().toString()).isEqualTo("claude-opus-5-5");
+        assertThat(sent.system()).isPresent();
+    }
+
+    @Test
+    void sendsTheModelsMaximumOutputUnlessTheRequestCapsItLower() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+        long modelMax = ModelCapabilityTable.findModel(Provider.ANTHROPIC, "claude-opus-5-5").orElseThrow().getMaxOutputTokens();
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder().prompt("Hi").build());
+        adapter.send("claude-opus-5-5", Request.builder().prompt("Hi").maxOutputTokens(2000).build());
+        adapter.send("claude-opus-5-5", Request.builder().prompt("Hi").maxOutputTokens(Integer.MAX_VALUE).build());
+
+        assertThat(captor.getAllValues()).extracting(MessageCreateParams::maxTokens)
+                .containsExactly(modelMax, 2000L, modelMax);
+    }
+
+    @Test
+    void sendsTheResponseSchemaWithAdditionalPropertiesFalseOnEveryObject() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("{}"));
+        Map<String, Object> callers = AnthropicSchemasTest.nestedSchema();
+
+        new AnthropicAdapter(client).send("claude-opus-5-5", Request.builder().prompt("Hi").responseSchema(callers).build());
+
+        Map<String, com.anthropic.core.JsonValue> sent =
+                captor.getValue().outputConfig().orElseThrow().format().orElseThrow().schema()._additionalProperties();
+        assertThat(sent.get("additionalProperties").convert(Boolean.class)).isFalse();
+        Map<Object, Object> properties = sent.get("properties").convert(Map.class);
+        assertThat((Map<Object, Object>) properties.get("address")).containsEntry("additionalProperties", false);
+        assertThat(callers).isEqualTo(AnthropicSchemasTest.nestedSchema());
+    }
+
+    @Test
+    void reportsASchemaItCantEnforceAndRefusesToSendIt() {
+        Map<String, Object> open = Map.of("type", "object", "properties",
+                Map.of("meta", Map.of("type", "object", "additionalProperties", true)));
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+
+        assertThat(adapter.responseSchemaProblem("claude-opus-5-5", open))
+                .contains("$.properties.meta.additionalProperties is true");
+        assertThat(adapter.responseSchemaProblem("claude-opus-5-5", AnthropicSchemasTest.nestedSchema())).isNull();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> adapter.send("claude-opus-5-5",
+                        Request.builder().prompt("Hi").responseSchema(open).build()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("$.properties.meta.additionalProperties");
+    }
+
+    @Test
+    void sendIncludesTemperatureAndTopPWhenPresent() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder().prompt("hi").temperature(0.7).topP(0.9).build());
+
+        assertThat(captor.getValue().temperature()).isEqualTo(java.util.Optional.of(0.7));
+        assertThat(captor.getValue().topP()).isEqualTo(java.util.Optional.of(0.9));
+    }
+
+    @Test
+    void sendOmitsTemperatureAndTopPWhenAbsent() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder().prompt("hi").build());
+
+        assertThat(captor.getValue().temperature()).isEmpty();
+        assertThat(captor.getValue().topP()).isEmpty();
+    }
+
+    @Test
+    void sendMapsToolUseBlockToToolCall() {
+        when(client.messages()).thenReturn(messageService);
+        when(messageService.create(any(MessageCreateParams.class))).thenReturn(toolUseMessage());
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        Response response = adapter.send("claude-opus-5-5", Request.builder().prompt("lookup something").build());
+
+        assertThat(response.getToolCalls()).hasSize(1);
+        assertThat(response.getToolCalls().get(0).getName()).isEqualTo("lookup");
+        assertThat(response.getToolCalls().get(0).getArguments()).containsEntry("query", "weather");
+    }
+
+    @Test
+    void sendUploadsAttachmentOnceAndReusesFileIdOnByteIdenticalRepeat() {
+        when(client.messages()).thenReturn(messageService);
+        when(client.files()).thenReturn(fileService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+        when(fileService.upload(any(FileUploadParams.class))).thenReturn(fixtureFileMetadata("file_abc"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        Attachment attachment = Attachment.builder().mediaType("image/png").data(new byte[]{1, 2, 3}).build();
+        Request request = Request.builder().prompt("describe this").attachments(List.of(attachment)).build();
+
+        adapter.send("claude-opus-5-5", request);
+        adapter.send("claude-opus-5-5", request);
+
+        verify(fileService, times(1)).upload(any(FileUploadParams.class));
+
+        for (MessageCreateParams sent : captor.getAllValues()) {
+            ImageBlockParam image = firstContentBlock(sent).asImage();
+            assertThat(image.source().isFile()).isTrue();
+            assertThat(image.source().asFile().fileId()).isEqualTo("file_abc");
+            assertThat(image.cacheControl()).isPresent();
+        }
+    }
+
+    @Test
+    void sendUploadsSeparateFileForDifferentAttachmentContent() {
+        when(client.messages()).thenReturn(messageService);
+        when(client.files()).thenReturn(fileService);
+        when(messageService.create(any(MessageCreateParams.class))).thenReturn(textMessage("ok"));
+        when(fileService.upload(any(FileUploadParams.class)))
+                .thenReturn(fixtureFileMetadata("file_one"))
+                .thenReturn(fixtureFileMetadata("file_two"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder().prompt("p")
+                .attachments(List.of(Attachment.builder().mediaType("image/png").data(new byte[]{1}).build()))
+                .build());
+        adapter.send("claude-opus-5-5", Request.builder().prompt("p")
+                .attachments(List.of(Attachment.builder().mediaType("image/png").data(new byte[]{2}).build()))
+                .build());
+
+        verify(fileService, times(2)).upload(any(FileUploadParams.class));
+    }
+
+    @Test
+    void sendUploadsDocumentAttachmentAndReferencesFileId() {
+        when(client.messages()).thenReturn(messageService);
+        when(client.files()).thenReturn(fileService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+        when(fileService.upload(any(FileUploadParams.class))).thenReturn(fixtureFileMetadata("file_doc"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder().prompt("summarize")
+                .attachments(List.of(Attachment.builder().mediaType("application/pdf").data(new byte[]{1, 2, 3}).build()))
+                .build());
+
+        DocumentBlockParam document = firstContentBlock(captor.getValue()).asDocument();
+        assertThat(document.source().isFile()).isTrue();
+        assertThat(document.source().asFile().fileId()).isEqualTo("file_doc");
+        assertThat(document.cacheControl()).isPresent();
+    }
+
+    @Test
+    void sendFallsBackToInlineEmbeddingWhenUploadFails() {
+        when(client.messages()).thenReturn(messageService);
+        when(client.files()).thenReturn(fileService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+        when(fileService.upload(any(FileUploadParams.class))).thenThrow(new RuntimeException("quota exceeded"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        Response response = adapter.send("claude-opus-5-5", Request.builder().prompt("describe this")
+                .attachments(List.of(Attachment.builder().mediaType("image/png").data(new byte[]{1, 2, 3}).build()))
+                .build());
+
+        assertThat(response.getContent()).isEqualTo("ok"); // upload failure doesn't fail the call
+        ImageBlockParam image = firstContentBlock(captor.getValue()).asImage();
+        assertThat(image.source().isBase64()).isTrue();
+        assertThat(image.cacheControl()).isPresent(); // cache_control still set on the inline fallback
+    }
+
+    @Test
+    void sendCorrelatesMultipleToolCallsNatively() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        ToolCall callA = ToolCall.builder().id("call_a").name("lookup").arguments(Map.of("query", "weather")).build();
+        ToolCall callB = ToolCall.builder().id("call_b").name("convert").arguments(Map.of("amount", 5)).build();
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder()
+                .prompt("continue")
+                .history(List.of(
+                        ai.halience.llm.router.model.Message.assistant("", List.of(callA, callB)),
+                        ai.halience.llm.router.model.Message.tool("call_a", "sunny"),
+                        ai.halience.llm.router.model.Message.tool("call_b", "5 miles")))
+                .build());
+
+        List<MessageParam> sent = captor.getValue().messages();
+        assertThat(sent).hasSize(4); // assistant tool_use turn + 2 tool_result turns + final prompt
+
+        MessageParam assistantTurn = sent.get(0);
+        assertThat(assistantTurn.role()).isEqualTo(com.anthropic.models.messages.MessageParam.Role.ASSISTANT);
+        List<ContentBlockParam> assistantBlocks = assistantTurn.content().asBlockParams();
+        assertThat(assistantBlocks).hasSize(2);
+        assertThat(assistantBlocks.get(0).asToolUse().id()).isEqualTo("call_a");
+        assertThat(assistantBlocks.get(0).asToolUse().name()).isEqualTo("lookup");
+        assertThat(assistantBlocks.get(1).asToolUse().id()).isEqualTo("call_b");
+
+        MessageParam toolResultA = sent.get(1);
+        assertThat(toolResultA.role()).isEqualTo(com.anthropic.models.messages.MessageParam.Role.USER);
+        ContentBlockParam toolResultBlockA = toolResultA.content().asBlockParams().get(0);
+        assertThat(toolResultBlockA.isToolResult()).isTrue();
+        assertThat(toolResultBlockA.asToolResult().toolUseId()).isEqualTo("call_a");
+        assertThat(toolResultBlockA.asToolResult().content().get().asString()).isEqualTo("sunny");
+
+        MessageParam toolResultB = sent.get(2);
+        ContentBlockParam toolResultBlockB = toolResultB.content().asBlockParams().get(0);
+        assertThat(toolResultBlockB.asToolResult().toolUseId()).isEqualTo("call_b");
+        assertThat(toolResultBlockB.asToolResult().content().get().asString()).isEqualTo("5 miles");
+    }
+
+    @Test
+    void sendFlattensALegacyToolMessageWithNoCorrelationId() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder()
+                .prompt("continue")
+                .history(List.of(ai.halience.llm.router.model.Message.tool("legacy result")))
+                .build());
+
+        MessageParam toolTurn = captor.getValue().messages().get(0);
+        assertThat(toolTurn.role()).isEqualTo(com.anthropic.models.messages.MessageParam.Role.USER);
+        // the conversation's last turn, so it carries the cache marker and goes as a text block
+        assertThat(toolTurn.content().asBlockParams()).singleElement()
+                .satisfies(block -> assertThat(block.asText().text()).isEqualTo("Tool result: legacy result"));
+    }
+
+    @Test
+    void sendsANegotiatedEffortInOutputConfigAndABudgetAsEnabledThinking() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        adapter.send("claude-opus-5-5", Request.builder().prompt("Hi").reasoningEffort("xhigh").build());
+        adapter.send("claude-haiku-4-5-20251001", Request.builder().prompt("Hi").reasoningBudgetTokens(4096).build());
+        adapter.send("claude-opus-5-5", Request.builder().prompt("Hi").build());
+
+        MessageCreateParams effort = captor.getAllValues().get(0);
+        assertThat(effort.outputConfig().orElseThrow().effort()).contains(OutputConfig.Effort.XHIGH);
+        assertThat(effort.thinking()).isEmpty();
+        MessageCreateParams budget = captor.getAllValues().get(1);
+        assertThat(budget.thinking().orElseThrow().asEnabled().budgetTokens()).isEqualTo(4096);
+        assertThat(budget.outputConfig()).isEmpty();
+        MessageCreateParams neither = captor.getAllValues().get(2);
+        assertThat(neither.thinking()).isEmpty();
+        assertThat(neither.outputConfig()).isEmpty();
+    }
+
+    @Test
+    void plainTextDocumentsGoInlineAsTextAndOtherDocumentTypesAreRefused() {
+        when(client.messages()).thenReturn(messageService);
+        ArgumentCaptor<MessageCreateParams> captor = ArgumentCaptor.forClass(MessageCreateParams.class);
+        when(messageService.create(captor.capture())).thenReturn(textMessage("ok"));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client); // no Files API stubbed, so attachments go inline
+        adapter.send("claude-opus-5-5", Request.builder().prompt("read")
+                .attachments(List.of(Attachment.builder().mediaType("text/plain").data("hello".getBytes()).build()))
+                .build());
+
+        DocumentBlockParam document = firstContentBlock(captor.getValue()).asDocument();
+        assertThat(document.source().isText()).isTrue();
+        assertThat(document.source().asText().data()).isEqualTo("hello");
+
+        assertThatThrownBy(() -> adapter.send("claude-opus-5-5", Request.builder().prompt("read")
+                .attachments(List.of(Attachment.builder().mediaType("text/csv").data(new byte[]{1}).build()))
+                .build()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("text/csv");
+    }
+
+    private static ContentBlockParam firstContentBlock(MessageCreateParams sent) {
+        MessageParam userMessage = sent.messages().get(sent.messages().size() - 1);
+        return userMessage.content().asBlockParams().get(0);
+    }
+
+    private static FileMetadata fixtureFileMetadata(String id) {
+        return FileMetadata.builder()
+                .id(id)
+                .createdAt(OffsetDateTime.now())
+                .filename("attachment")
+                .mimeType("application/octet-stream")
+                .sizeBytes(3)
+                .build();
+    }
+
+    @Test
+    void sendAsyncUsesTheSdksNativeAsyncClient() {
+        when(client.async()).thenReturn(asyncClient);
+        when(asyncClient.messages()).thenReturn(asyncMessageService);
+        when(asyncMessageService.create(any(MessageCreateParams.class)))
+                .thenReturn(CompletableFuture.completedFuture(textMessage("async result")));
+
+        AnthropicAdapter adapter = new AnthropicAdapter(client);
+        CompletableFuture<Response> future = adapter.sendAsync("claude-opus-5-5", Request.builder().prompt("hi").build());
+
+        assertThat(future.join().getContent()).isEqualTo("async result");
+    }
+
+    private static Usage fixtureUsage(long inputTokens, long outputTokens) {
+        return Usage.builder()
+                .inputTokens(inputTokens)
+                .outputTokens(outputTokens)
+                .cacheCreation(com.anthropic.models.messages.CacheCreation.builder()
+                        .ephemeral1hInputTokens(0)
+                        .ephemeral5mInputTokens(0)
+                        .build())
+                .cacheCreationInputTokens(0L)
+                .cacheReadInputTokens(0L)
+                .inferenceGeo(java.util.Optional.empty())
+                .outputTokensDetails(java.util.Optional.empty())
+                .serverToolUse(java.util.Optional.empty())
+                .serviceTier(java.util.Optional.empty())
+                .build();
+    }
+
+    private static Message.Builder fixtureMessageBuilder(String id) {
+        return Message.builder()
+                .id(id)
+                .model("claude-opus-5-5")
+                .container(java.util.Optional.empty())
+                .stopDetails(java.util.Optional.empty())
+                .stopReason(java.util.Optional.empty())
+                .stopSequence(java.util.Optional.empty());
+    }
+
+    private static Message textMessage(String text) {
+        return fixtureMessageBuilder("msg_1")
+                .content(List.of(ContentBlock.ofText(
+                        TextBlock.builder().text(text).citations(List.of()).build())))
+                .usage(fixtureUsage(10, 5))
+                .build();
+    }
+
+    private static Message toolUseMessage() {
+        ToolUseBlock toolUse = ToolUseBlock.builder()
+                .id("call_1")
+                .name("lookup")
+                .input(com.anthropic.core.JsonValue.from(Map.of("query", "weather")))
+                .caller(com.anthropic.models.messages.ToolUseBlock.Caller.ofDirect(
+                        com.anthropic.models.messages.DirectCaller.builder().build()))
+                .build();
+        return fixtureMessageBuilder("msg_2")
+                .content(List.of(ContentBlock.ofToolUse(toolUse)))
+                .usage(fixtureUsage(8, 4))
+                .build();
+    }
+}

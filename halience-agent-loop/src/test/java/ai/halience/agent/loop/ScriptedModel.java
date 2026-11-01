@@ -1,0 +1,111 @@
+package ai.halience.agent.loop;
+
+import ai.halience.llm.router.LlmRouter;
+import ai.halience.llm.router.capability.ModelCapabilityTable;
+import ai.halience.llm.router.capability.ModelEntry;
+import ai.halience.llm.router.model.Message;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+import ai.halience.llm.router.model.Role;
+import ai.halience.llm.router.model.ToolCall;
+import ai.halience.llm.router.provider.Provider;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Consumer;
+import java.util.function.Function;
+
+/**
+ * Test helper: a mocked model. Registers a synthetic capable model, records every request the
+ * router sends, and answers with a caller-supplied function. Call {@link #close()} after the test.
+ */
+final class ScriptedModel implements AutoCloseable {
+
+    static final String MODEL = "test-scripted-model";
+    static final AgentProfile RECURSIVE = AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build();
+
+    final List<Request> requests = new CopyOnWriteArrayList<>();
+    private volatile Function<Request, Response> responder = request -> complete("done");
+
+    ScriptedModel() {
+        ModelCapabilityTable.registerModel(ModelEntry.builder()
+                .provider(Provider.ANTHROPIC).model(MODEL)
+                .contextWindowTokens(200_000).maxOutputTokens(4_000)
+                .supportsTools(true).supportsStructuredOutput(true).supportsVision(true).supportsFileInput(true)
+                .build());
+    }
+
+    ScriptedModel respond(Function<Request, Response> responder) {
+        this.responder = responder;
+        return this;
+    }
+
+    LlmRouter router() {
+        return new LlmRouter(List.of(new FakeProviderAdapter(request -> {
+            requests.add(request);
+            return responder.apply(request);
+        }) {
+            /** Streams like a real provider: the text word by word, then the full response. */
+            @Override
+            public Response sendStreaming(String model, Request adaptedRequest, Consumer<String> onText) {
+                Response response = send(model, adaptedRequest);
+                String content = response.getContent() == null ? "" : response.getContent();
+                for (String piece : content.split("(?<= )")) {
+                    if (!piece.isEmpty()) {
+                        onText.accept(piece);
+                    }
+                }
+                streamedRequests.add(adaptedRequest);
+                return response;
+            }
+        }));
+    }
+
+    /** Requests that were sent with streaming. */
+    final List<Request> streamedRequests = new CopyOnWriteArrayList<>();
+
+    /** A plain-text reply: how the model gives its final answer. */
+    static Response text(String content) {
+        return Response.builder().content(content).build();
+    }
+
+    /** Text and tool calls in one reply, e.g. "Let me look that up." plus a lookup. */
+    static Response textAndToolCall(String content, String id, String name, Map<String, Object> arguments) {
+        return Response.builder()
+                .content(content)
+                .toolCalls(List.of(ToolCall.builder().id(id).name(name).arguments(arguments).build()))
+                .build();
+    }
+
+    AgentLoop.Builder loop() {
+        return AgentLoop.builder().router(router());
+    }
+
+    @Override
+    public void close() {
+        ModelCapabilityTable.removeModel(Provider.ANTHROPIC, MODEL);
+    }
+
+    static Response toolCall(String id, String name, Map<String, Object> arguments) {
+        return Response.builder()
+                .content("")
+                .toolCalls(List.of(ToolCall.builder().id(id).name(name).arguments(arguments).build()))
+                .build();
+    }
+
+    static Response complete(String answer) {
+        return toolCall("done", "report_complete", Map.of("finalAnswer", answer));
+    }
+
+    /** The most recent tool result in a request's history, or {@code null}. */
+    static String lastToolResult(Request request) {
+        List<Message> history = request.getHistory();
+        for (int i = history.size() - 1; i >= 0; i--) {
+            if (history.get(i).getRole() == Role.TOOL) {
+                return history.get(i).getContent();
+            }
+        }
+        return null;
+    }
+}

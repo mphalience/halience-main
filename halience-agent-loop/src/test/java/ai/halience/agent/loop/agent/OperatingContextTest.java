@@ -1,0 +1,135 @@
+package ai.halience.agent.loop.agent;
+
+import ai.halience.agent.loop.AgentProfile;
+import ai.halience.agent.loop.LoopRequest;
+import ai.halience.agent.loop.PlanMode;
+import ai.halience.agent.loop.Scope;
+import ai.halience.agent.loop.testing.MockModel;
+import ai.halience.agent.loop.tool.builtin.DelegationTools;
+import ai.halience.llm.router.config.RouteEntry;
+import ai.halience.llm.router.config.RouterConfig;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.provider.Provider;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+/** Per-run operating context: the user's live context, given per turn while the agent definition stays fixed. */
+class OperatingContextTest {
+
+    private static final Scope ALICE = Scope.of("acme", "alice", "s1");
+    private static final String CONTEXT = "User: Alice Smith, founder of Acme Ltd.\nOn file: pitch deck v3, Q3 accounts.";
+    private static final String HEADING = "## Operating context for this run";
+
+    private static Agent research() {
+        return Agent.builder("---\nname: research\ndescription: Market research\nplan_mode: recursive\n---\nYou research markets.").build();
+    }
+
+    private static Agent chat(Agent... delegates) {
+        Agent.Builder builder = Agent.builder("---\nname: chat\nplan_mode: recursive\nmax_steps: 7\n---\nYou are the chat agent.");
+        for (Agent delegate : delegates) {
+            builder.delegateTo(delegate);
+        }
+        return builder.build();
+    }
+
+    private static MockModel delegatingModel() {
+        return new MockModel()
+                .callTool(DelegationTools.DELEGATE, Map.of("agent", "research", "task", "Size the UK market"))
+                .reply("About 2m firms.")
+                .reply("The UK market is about 2m firms.");
+    }
+
+    @Test
+    void theRunsContextReachesItsSystemPromptAfterTheAgentsOwnInstructions() {
+        MockModel model = new MockModel().reply("Hi Alice.");
+        AgentRuntime runtime = new AgentRuntime(model.loopBuilder().build());
+
+        runtime.runAndWait(chat(), LoopRequest.builder().prompt("hello").scope(ALICE).operatingContext(CONTEXT)
+                // The agent's own profile wins over one set on the request.
+                .agentProfile(AgentProfile.builder().instructions("IGNORED").planMode(PlanMode.ALWAYS_PLAN).build()));
+
+        String system = systemPrompt(model.requests().getFirst());
+        assertThat(system).startsWith("You are the chat agent.").doesNotContain("IGNORED")
+                .contains(HEADING + "\n" + CONTEXT);
+        assertThat(system.indexOf(HEADING)).isGreaterThan(system.indexOf("Agent operating profile:"));
+        assertThat(model.requests()).hasSize(1); // still the agent's recursive plan mode: no planning calls
+    }
+
+    @Test
+    void eachTurnCanCarryDifferentContextWhileTheAgentStaysTheSame() {
+        MockModel model = new MockModel().reply("One.").reply("Two.").reply("Three.");
+        AgentRuntime runtime = new AgentRuntime(model.loopBuilder().build());
+        Agent agent = chat();
+
+        runtime.runAndWait(agent, LoopRequest.builder().prompt("a").scope(ALICE).operatingContext("Plan: free"));
+        runtime.runAndWait(agent, LoopRequest.builder().prompt("b").scope(ALICE).operatingContext("Plan: paid"));
+        runtime.runAndWait(agent, LoopRequest.builder().prompt("c").scope(ALICE));
+
+        assertThat(systemPrompt(model.requests().get(0))).contains("Plan: free").doesNotContain("Plan: paid");
+        assertThat(systemPrompt(model.requests().get(1))).contains("Plan: paid").doesNotContain("Plan: free");
+        assertThat(systemPrompt(model.requests().get(2))).doesNotContain(HEADING);
+    }
+
+    @Test
+    void withoutContextThereIsNoContextSection() {
+        MockModel model = new MockModel().reply("Hi.");
+        new AgentRuntime(model.loopBuilder().build()).runAndWait(chat(), LoopRequest.builder().prompt("hi").scope(ALICE)
+                .operatingContext("   "));
+
+        assertThat(systemPrompt(model.requests().getFirst())).doesNotContain(HEADING);
+    }
+
+    @Test
+    void aDelegatedRunInheritsTheContextByDefault() {
+        MockModel model = delegatingModel();
+        AgentRuntime runtime = new AgentRuntime(model.loopBuilder().build());
+
+        runtime.runAndWait(chat(research()), LoopRequest.builder().prompt("How big is the UK market?").scope(ALICE)
+                .operatingContext(CONTEXT));
+
+        Request delegated = model.requests().get(1);
+        assertThat(systemPrompt(delegated)).startsWith("You research markets.").contains(HEADING + "\n" + CONTEXT);
+        assertThat(delegated.getPrompt()).isEqualTo("Size the UK market");
+    }
+
+    @Test
+    void aDelegateCanOptOutOfInheritingTheContext() {
+        MockModel model = delegatingModel();
+        AgentRuntime runtime = new AgentRuntime(model.loopBuilder().build());
+        Agent chat = Agent.builder("---\nname: chat\nplan_mode: recursive\n---\nYou are the chat agent.")
+                .delegateTo(runtime.delegate(research(), false))
+                .build();
+
+        runtime.runAndWait(chat, LoopRequest.builder().prompt("How big is the UK market?").scope(ALICE).operatingContext(CONTEXT));
+
+        assertThat(systemPrompt(model.requests().getFirst())).contains(CONTEXT);
+        assertThat(systemPrompt(model.requests().get(1))).startsWith("You research markets.")
+                .doesNotContain(HEADING).doesNotContain("Alice");
+    }
+
+    @Test
+    void routerConfigStillOverridesPerRequest() {
+        MockModel model = new MockModel().reply("Hi.");
+        RouterConfig pinned = RouterConfig.builder().route(List.of(RouteEntry.of(Provider.ANTHROPIC))).build();
+
+        new AgentRuntime(model.loopBuilder().build()).runAndWait(chat(), LoopRequest.builder().prompt("hi").scope(ALICE)
+                .operatingContext(CONTEXT).routerConfig(pinned));
+
+        assertThat(model.requests().getFirst().getConfig().getRoute()).isEqualTo(pinned.getRoute());
+    }
+
+    /**
+     * The system prompt as every provider receives it: the request's instructions, then its history's system
+     * turns (where the run's operating context goes, so the instructions stay the same from run to run).
+     */
+    private static String systemPrompt(Request request) {
+        StringBuilder system = new StringBuilder(request.getSystemInstructions());
+        request.getHistory().stream().filter(m -> m.getRole() == ai.halience.llm.router.model.Role.SYSTEM)
+                .forEach(m -> system.append("\n\n").append(m.getContent()));
+        return system.toString();
+    }
+}

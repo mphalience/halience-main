@@ -1,0 +1,570 @@
+package ai.halience.agent.loop;
+
+import ai.halience.llm.router.LlmRouter;
+import ai.halience.llm.router.capability.ModelCapabilityTable;
+import ai.halience.llm.router.capability.ModelEntry;
+import ai.halience.llm.router.model.Message;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+import ai.halience.llm.router.model.Role;
+import ai.halience.llm.router.model.ToolCall;
+import ai.halience.llm.router.model.ToolDefinition;
+import ai.halience.llm.router.model.Usage;
+import ai.halience.llm.router.provider.Provider;
+import ai.halience.agent.loop.AgentLoopRunSupport.Capture;
+import ai.halience.agent.loop.compression.CompressionMethod;
+import ai.halience.agent.loop.compression.HistoryCompressor;
+import ai.halience.agent.loop.execution.StepAction;
+import ai.halience.agent.loop.execution.TerminationReason;
+import ai.halience.agent.loop.tool.ToolRegistry;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static ai.halience.agent.loop.AgentLoopRunSupport.run;
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+class AgentLoopTest {
+
+    private static final String MODEL = "test-agent-loop-model";
+    private static final String TINY_MODEL = "test-agent-loop-tiny-model";
+
+    @AfterEach
+    void removeSyntheticModel() {
+        ModelCapabilityTable.removeModel(Provider.ANTHROPIC, MODEL);
+    }
+
+    @Test
+    void constructorRejectsNullRouter() {
+        assertThatThrownBy(() -> new AgentLoop(null)).isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void canonicalRunRejectsNullRequest() {
+        AgentLoop loop = new AgentLoop(new LlmRouter(List.of()));
+        assertThatThrownBy(() -> loop.run((LoopRequest) null)).isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void shortOverloadValidatesPromptBeforeSubmittingAnyWork() {
+        AgentLoop loop = new AgentLoop(new LlmRouter(List.of()));
+        assertThatThrownBy(() -> loop.run((String) null, r -> { }, e -> { }))
+                .isInstanceOf(NullPointerException.class);
+    }
+
+    @Test
+    void neverPlanModeMakesExactlyOneCallAndReturnsItsContent() throws InterruptedException {
+        registerModel();
+        AtomicInteger calls = new AtomicInteger();
+        AgentLoop loop = newLoop(request -> {
+            calls.incrementAndGet();
+            return Response.builder().content("Paris is the capital of France.").build();
+        });
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("What is the capital of France?")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.NEVER_PLAN).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result()).isNotNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("Paris is the capital of France.");
+        assertThat(capture.result().execution().steps()).hasSize(1);
+        assertThat(calls.get()).isEqualTo(1);
+    }
+
+    @Test
+    void recursiveModeCompletesViaReportCompleteToolCall() throws InterruptedException {
+        registerModel();
+        AgentLoop loop = newLoop(request -> Response.builder()
+                .content("")
+                .toolCalls(List.of(ToolCall.builder()
+                        .id("1")
+                        .name("report_complete")
+                        .arguments(Map.of("finalAnswer", "done"))
+                        .build()))
+                .build());
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Do a simple thing")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("done");
+        assertThat(capture.result().execution().terminationReason()).isEqualTo(TerminationReason.COMPLETED);
+        assertThat(capture.messages()).anyMatch(m -> m.type() == MessageType.INFO && m.message().equals("Goal complete."));
+    }
+
+    @Test
+    void registeredToolIsCalledAndItsResultFeedsBackIntoTheLoop() throws InterruptedException {
+        registerModel();
+        AtomicInteger calls = new AtomicInteger();
+        AgentLoop loop = newLoop(List.of(), request -> {
+            int callNumber = calls.incrementAndGet();
+            if (callNumber == 1) {
+                return Response.builder()
+                        .toolCalls(List.of(ToolCall.builder().id("1").name("echo").arguments(Map.of("text", "hi")).build()))
+                        .content("")
+                        .build();
+            }
+            return Response.builder()
+                    .toolCalls(List.of(ToolCall.builder()
+                            .id("2").name("report_complete").arguments(Map.of("finalAnswer", "echoed: hi")).build()))
+                    .content("")
+                    .build();
+        }, registry -> registry.register(
+                ai.halience.llm.router.model.ToolDefinition.builder()
+                        .name("echo")
+                        .description("Echoes text back")
+                        .parameters(Map.of("type", "object"))
+                        .build(),
+                args -> "echo:" + args.get("text")));
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Echo hi")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("echoed: hi");
+        assertThat(capture.result().execution().steps())
+                .anyMatch(s -> s.toolName() != null && s.toolName().equals("echo") && "echo:hi".equals(s.toolResult()));
+        assertThat(capture.messages()).anyMatch(m -> m.type() == MessageType.TOOL_CALL);
+        assertThat(capture.messages()).anyMatch(m -> m.type() == MessageType.TOOL_RESULT);
+    }
+
+    @Test
+    void multipleToolCallsInOneTurnAreCorrelatedInHistory() throws InterruptedException {
+        registerModel();
+        AtomicInteger calls = new AtomicInteger();
+        List<ai.halience.llm.router.model.Request> capturedRequests = new java.util.concurrent.CopyOnWriteArrayList<>();
+        AgentLoop loop = newLoop(List.of(), request -> {
+            capturedRequests.add(request);
+            if (calls.incrementAndGet() == 1) {
+                return Response.builder()
+                        .content("")
+                        .toolCalls(List.of(
+                                ToolCall.builder().id("a").name("echo").arguments(Map.of("text", "hi")).build(),
+                                ToolCall.builder().id("b").name("shout").arguments(Map.of("text", "yo")).build()))
+                        .build();
+            }
+            return Response.builder()
+                    .content("")
+                    .toolCalls(List.of(ToolCall.builder()
+                            .id("c").name("report_complete").arguments(Map.of("finalAnswer", "done")).build()))
+                    .build();
+        }, registry -> registry
+                .register(ai.halience.llm.router.model.ToolDefinition.builder()
+                                .name("echo")
+                                .description("Echoes text back")
+                                .parameters(Map.of("type", "object"))
+                                .build(),
+                        args -> "echo:" + args.get("text"))
+                .register(ai.halience.llm.router.model.ToolDefinition.builder()
+                                .name("shout")
+                                .description("Shouts text back")
+                                .parameters(Map.of("type", "object"))
+                                .build(),
+                        args -> "SHOUT:" + args.get("text")));
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("do two things")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("done");
+        assertThat(capture.result().execution().steps())
+                .anyMatch(s -> "echo".equals(s.toolName()) && "echo:hi".equals(s.toolResult()));
+        assertThat(capture.result().execution().steps())
+                .anyMatch(s -> "shout".equals(s.toolName()) && "SHOUT:yo".equals(s.toolResult()));
+
+        // The second call's history is where the fix matters: one correlated assistant turn
+        // carrying both requested calls, followed by two tool-result turns keyed by call id.
+        List<ai.halience.llm.router.model.Message> history = capturedRequests.get(1).getHistory();
+
+        ai.halience.llm.router.model.Message assistantTurn = history.stream()
+                .filter(m -> m.getRole() == ai.halience.llm.router.model.Role.ASSISTANT)
+                .findFirst().orElseThrow();
+        assertThat(assistantTurn.getToolCalls()).extracting(ToolCall::getId).containsExactly("a", "b");
+
+        List<ai.halience.llm.router.model.Message> toolResults = history.stream()
+                .filter(m -> m.getRole() == ai.halience.llm.router.model.Role.TOOL)
+                .toList();
+        assertThat(toolResults).hasSize(2);
+        assertThat(toolResults.get(0).getToolCallId()).isEqualTo("a");
+        assertThat(toolResults.get(0).getContent()).isEqualTo("echo:hi");
+        assertThat(toolResults.get(1).getToolCallId()).isEqualTo("b");
+        assertThat(toolResults.get(1).getContent()).isEqualTo("SHOUT:yo");
+    }
+
+    @Test
+    void unregisteredToolCallEndsTheRunWithAnError() throws InterruptedException {
+        registerModel();
+        AgentLoop loop = newLoop(request -> Response.builder()
+                .content("")
+                .toolCalls(List.of(ToolCall.builder().id("1").name("not_registered").arguments(Map.of()).build()))
+                .build());
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Do something")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+        assertThat(capture.result()).isNull();
+        assertThat(capture.error()).isInstanceOf(UnregisteredToolException.class);
+    }
+
+    @Test
+    void unregisteredToolCallResolvedByTheCallerFeedsBackIntoTheLoop() throws InterruptedException {
+        registerModel();
+        List<Request> requests = new CopyOnWriteArrayList<>();
+        List<ToolCall> handedOver = new CopyOnWriteArrayList<>();
+        AgentLoop loop = newLoop(request -> {
+            requests.add(request);
+            return requests.size() == 1
+                    ? Response.builder()
+                            .content("")
+                            .toolCalls(List.of(ToolCall.builder()
+                                    .id("u1").name("ask_human").arguments(Map.of("question", "ok?")).build()))
+                            .build()
+                    : reportComplete("done");
+        });
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Check with a human")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build())
+                .onUnregisteredTool(call -> {
+                    handedOver.add(call);
+                    return Optional.of("human says yes");
+                }));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("done");
+        assertThat(handedOver).singleElement().satisfies(call -> {
+            assertThat(call.getName()).isEqualTo("ask_human");
+            assertThat(call.getArguments()).containsEntry("question", "ok?");
+        });
+        assertThat(capture.result().execution().steps())
+                .anyMatch(s -> "ask_human".equals(s.toolName()) && "human says yes".equals(s.toolResult()));
+
+        Message toolResult = requests.get(1).getHistory().stream()
+                .filter(m -> m.getRole() == Role.TOOL).findFirst().orElseThrow();
+        assertThat(toolResult.getToolCallId()).isEqualTo("u1");
+        assertThat(toolResult.getContent()).isEqualTo("human says yes");
+    }
+
+    @Test
+    void unregisteredToolCallTheCallerDeclinesStillEndsTheRunWithAnError() throws InterruptedException {
+        registerModel();
+        AgentLoop loop = newLoop(request -> Response.builder()
+                .content("")
+                .toolCalls(List.of(ToolCall.builder().id("1").name("not_registered").arguments(Map.of()).build()))
+                .build());
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Do something")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build())
+                .onUnregisteredTool(call -> Optional.empty()));
+
+        assertThat(capture.result()).isNull();
+        assertThat(capture.error()).isInstanceOf(UnregisteredToolException.class);
+    }
+
+    @Test
+    void reachingMaxStepsWrapsUpWithAToolsOffAnswer() throws InterruptedException {
+        registerModel();
+        AgentLoop loop = newLoop(List.of(), request -> request.getTools().isEmpty()
+                ? Response.builder().content("Best answer from what I found.").build()
+                : Response.builder()
+                        .content("")
+                        .toolCalls(List.of(ToolCall.builder().id("1").name("noop").arguments(Map.of()).build()))
+                        .build(), registry -> registry.register(
+                ai.halience.llm.router.model.ToolDefinition.builder()
+                        .name("noop")
+                        .description("Does nothing")
+                        .parameters(Map.of("type", "object"))
+                        .build(),
+                args -> "ok"));
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Loop forever")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).maxSteps(2).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().execution().terminationReason()).isEqualTo(TerminationReason.STEP_LIMIT_REACHED);
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("Best answer from what I found.");
+    }
+
+    @Test
+    void costLimitReachedWrapsUpWithAToolsOffAnswerRatherThanAnError() throws InterruptedException {
+        registerModel();
+        AtomicInteger calls = new AtomicInteger();
+        // LlmRouter recomputes Usage.estimatedCostUsdCents itself from whichever real model it
+        // routes to (registerModel()'s synthetic entry isn't guaranteed to win route selection
+        // against llm-router's own seeded models) — 1,000,000 input tokens costs well over 1 cent
+        // under any plausible real per-token pricing, so the exact model chosen doesn't matter.
+        AgentLoop loop = newLoop(List.of(), request -> {
+            calls.incrementAndGet();
+            if (request.getTools().isEmpty()) {
+                return Response.builder().content("Here's what I found so far.").build();
+            }
+            return Response.builder()
+                    .content("still working")
+                    .usage(Usage.builder().inputTokens(1_000_000).build())
+                    .toolCalls(List.of(ToolCall.builder().id("1").name("noop").arguments(Map.of()).build()))
+                    .build();
+        }, registry -> registry.register(
+                ai.halience.llm.router.model.ToolDefinition.builder()
+                        .name("noop")
+                        .description("Does nothing")
+                        .parameters(Map.of("type", "object"))
+                        .build(),
+                args -> "ok"));
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Loop forever")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build())
+                .maxCostUsdCents(1));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result()).isNotNull();
+        assertThat(capture.result().execution().terminationReason()).isEqualTo(TerminationReason.COST_LIMIT_REACHED);
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("Here's what I found so far.");
+        assertThat(calls.get()).isEqualTo(2); // one working step, then the wrap-up
+        assertThat(capture.messages()).anyMatch(
+                m -> m.type() == MessageType.WARNING && m.message().startsWith("Reached the cost limit"));
+    }
+
+    @Test
+    void timeLimitReachedWrapsUpWithAToolsOffAnswerRatherThanAnError() throws InterruptedException {
+        registerModel();
+        AgentLoop loop = newLoop(List.of(), request -> {
+            if (request.getTools().isEmpty()) {
+                return Response.builder().content("Here's what I found so far.").build();
+            }
+            try {
+                Thread.sleep(20);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return Response.builder()
+                    .content("still working")
+                    .toolCalls(List.of(ToolCall.builder().id("1").name("noop").arguments(Map.of()).build()))
+                    .build();
+        }, registry -> registry.register(
+                ai.halience.llm.router.model.ToolDefinition.builder()
+                        .name("noop")
+                        .description("Does nothing")
+                        .parameters(Map.of("type", "object"))
+                        .build(),
+                args -> "ok"));
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Loop forever")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build())
+                .maxDuration(Duration.ofMillis(1)));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result()).isNotNull();
+        assertThat(capture.result().execution().terminationReason()).isEqualTo(TerminationReason.TIME_LIMIT_REACHED);
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("Here's what I found so far.");
+        assertThat(capture.messages()).anyMatch(
+                m -> m.type() == MessageType.WARNING && m.message().startsWith("Reached the time limit"));
+    }
+
+    @Test
+    void planStepsSeeTheOverallGoalAndEarlierStepsAnswers() throws InterruptedException {
+        registerModel();
+        List<Request> stepRequests = new CopyOnWriteArrayList<>();
+        AgentLoop loop = newLoop(request -> {
+            if (request.getPrompt().contains("Produce an ordered list of steps")) {
+                return Response.builder()
+                        .content("{\"summary\":\"two steps\",\"steps\":[{\"description\":\"step one\"},{\"description\":\"step two\"}]}")
+                        .build();
+            }
+            stepRequests.add(request);
+            return reportComplete("answer " + stepRequests.size());
+        });
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Do it in two steps")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.ALWAYS_PLAN).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("answer 2");
+        assertThat(stepRequests).hasSize(2);
+
+        List<Message> stepTwoHistory = stepRequests.get(1).getHistory();
+        assertThat(stepTwoHistory).anyMatch(m -> m.getRole() == Role.USER
+                && m.getContent().equals("Overall goal: Do it in two steps"));
+        assertThat(stepTwoHistory).anyMatch(m -> m.getRole() == Role.ASSISTANT
+                && m.getContent().contains("step one") && m.getContent().contains("answer 1"));
+    }
+
+    @Test
+    void subTaskResultIsCorrelatedToItsSpawnCallInHistory() throws InterruptedException {
+        registerModel();
+        List<Request> requests = new CopyOnWriteArrayList<>();
+        AgentLoop loop = newLoop(request -> {
+            requests.add(request);
+            return switch (requests.size()) {
+                case 1 -> Response.builder()
+                        .content("")
+                        .toolCalls(List.of(ToolCall.builder()
+                                .id("s1").name("spawn_sub_task").arguments(Map.of("goal", "the sub-goal")).build()))
+                        .build();
+                case 2 -> reportComplete("sub answer");
+                default -> reportComplete("done");
+            };
+        });
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Delegate something")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("done");
+
+        List<Message> parentHistory = requests.get(2).getHistory();
+        Message spawnTurn = parentHistory.stream().filter(m -> m.getRole() == Role.ASSISTANT).findFirst().orElseThrow();
+        assertThat(spawnTurn.getToolCalls()).extracting(ToolCall::getId).containsExactly("s1");
+        Message resultTurn = parentHistory.stream().filter(m -> m.getRole() == Role.TOOL).findFirst().orElseThrow();
+        assertThat(resultTurn.getToolCallId()).isEqualTo("s1");
+        assertThat(resultTurn.getContent()).isEqualTo("sub answer");
+    }
+
+    @Test
+    void toolCallsRequestedAlongsideReportCompleteAreReportedNotSilentlyDropped() throws InterruptedException {
+        registerModel();
+        AtomicInteger echoCalls = new AtomicInteger();
+        AgentLoop loop = newLoop(List.of(), request -> Response.builder()
+                .content("")
+                .toolCalls(List.of(
+                        ToolCall.builder().id("1").name("echo").arguments(Map.of("text", "hi")).build(),
+                        ToolCall.builder().id("2").name("report_complete").arguments(Map.of("finalAnswer", "done")).build()))
+                .build(), registry -> registry.register(
+                ToolDefinition.builder().name("echo").description("Echoes text back").parameters(Map.of("type", "object")).build(),
+                args -> {
+                    echoCalls.incrementAndGet();
+                    return "echo";
+                }));
+
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Finish")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+        assertThat(capture.error()).isNull();
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("done");
+        assertThat(echoCalls.get()).isZero();
+        assertThat(capture.messages()).anyMatch(m -> m.type() == MessageType.WARNING
+                && m.message().contains("report_complete") && m.message().contains("echo"));
+    }
+
+    @Test
+    void planCheckAndPlanGenerationCountTowardMaxSteps() throws InterruptedException {
+        registerModel();
+        AtomicInteger stepCalls = new AtomicInteger();
+        AgentLoop loop = newLoop(request -> {
+            boolean isPlanCheck = request.getPrompt().contains("Does accomplishing this require");
+            if (isPlanCheck || request.getPrompt().contains("Produce an ordered list of steps")) {
+                return Response.builder()
+                        .content(isPlanCheck
+                                ? "{\"needsPlan\":true,\"reason\":\"multi-step\"}"
+                                : "{\"summary\":\"one step\",\"steps\":[{\"description\":\"step one\"}]}")
+                        .build();
+            }
+            if (request.getPrompt().startsWith(AgentLoop.WRAP_UP_PREFIX)) {
+                return Response.builder().content("Wrapped up.").build();
+            }
+            stepCalls.incrementAndGet();
+            return reportComplete("done");
+        });
+
+        // AUTO: plan check (1) + plan generation (2) exhausts maxSteps before the plan's first step runs.
+        Capture capture = run(loop, LoopRequest.builder()
+                .prompt("Plan this")
+                .agentProfile(AgentProfile.builder().planMode(PlanMode.AUTO).maxSteps(2).build()));
+
+        assertThat(capture.result().execution().terminationReason()).isEqualTo(TerminationReason.STEP_LIMIT_REACHED);
+        assertThat(capture.result().finalResponse().getContent()).isEqualTo("Wrapped up.");
+        assertThat(stepCalls.get()).isZero();
+    }
+
+    @Test
+    void historyCompressionIsReportedInMessagesAndTheExecutionTrace() throws InterruptedException {
+        registerModel();
+        ModelCapabilityTable.registerModel(ModelEntry.builder()
+                .provider(Provider.ANTHROPIC)
+                .model(TINY_MODEL)
+                .contextWindowTokens(6_500)
+                .maxOutputTokens(0)
+                .build());
+        try {
+            AtomicInteger calls = new AtomicInteger();
+            LlmRouter router = new LlmRouter(
+                    List.of(new FakeProviderAdapter(request -> calls.incrementAndGet() <= 3
+                            ? Response.builder()
+                                    .content("")
+                                    .toolCalls(List.of(ToolCall.builder()
+                                            .id("t" + calls.get()).name("bulky").arguments(Map.of()).build()))
+                                    .build()
+                            : reportComplete("done"))),
+                    // Pins compression to a tiny synthetic model regardless of which model the router actually picks.
+                    (provider, model, request) -> HistoryCompressor.compress(
+                            request, Provider.ANTHROPIC, TINY_MODEL, List.of(CompressionMethod.SLIDING_WINDOW_TRUNCATION)).request());
+            ToolRegistry registry = new ToolRegistry().register(
+                    ToolDefinition.builder().name("bulky").description("Returns a lot").parameters(Map.of("type", "object")).build(),
+                    args -> "x".repeat(10_000)); // ~2,500 tokens; three of them overflow the 6,500-token window
+            AgentLoop loop = new AgentLoop(router, registry);
+
+            Capture capture = run(loop, LoopRequest.builder()
+                    .prompt("Gather a lot")
+                    .agentProfile(AgentProfile.builder().planMode(PlanMode.RECURSIVE_ON_EACH_STEP).build()));
+
+            assertThat(capture.error()).isNull();
+            assertThat(capture.messages()).anyMatch(m -> m.type() == MessageType.INFO
+                    && m.message().startsWith("Compressed history") && m.message().contains("SLIDING_WINDOW_TRUNCATION"));
+            assertThat(capture.result().execution().steps())
+                    .anyMatch(s -> s.action() == StepAction.HISTORY_COMPRESSION && s.thread() == 0);
+        } finally {
+            ModelCapabilityTable.removeModel(Provider.ANTHROPIC, TINY_MODEL);
+        }
+    }
+
+    private static Response reportComplete(String finalAnswer) {
+        return Response.builder()
+                .content("")
+                .toolCalls(List.of(ToolCall.builder()
+                        .id("rc").name("report_complete").arguments(Map.of("finalAnswer", finalAnswer)).build()))
+                .build();
+    }
+
+    private static void registerModel() {
+        ModelCapabilityTable.registerModel(ModelEntry.builder()
+                .provider(Provider.ANTHROPIC)
+                .model(MODEL)
+                .contextWindowTokens(100_000)
+                .maxOutputTokens(4_000)
+                .supportsTools(true)
+                .supportsStructuredOutput(true)
+                .build());
+    }
+
+    private static AgentLoop newLoop(java.util.function.Function<ai.halience.llm.router.model.Request, Response> responder) {
+        return newLoop(List.of(), responder, registry -> { });
+    }
+
+    private static AgentLoop newLoop(
+            List<Object> unused,
+            java.util.function.Function<ai.halience.llm.router.model.Request, Response> responder,
+            java.util.function.Consumer<ToolRegistry> registration) {
+        LlmRouter router = new LlmRouter(List.of(new FakeProviderAdapter(responder)));
+        ToolRegistry registry = new ToolRegistry();
+        registration.accept(registry);
+        return new AgentLoop(router, registry);
+    }
+}

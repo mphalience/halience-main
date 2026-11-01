@@ -1,0 +1,68 @@
+spring:
+  application:
+    name: aql-brain
+  datasource:
+    # Local default: a file-based H2 database. Use the postgres profile in deployment.
+    url: jdbc:h2:file:./data/aql;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE
+    username: sa
+    password: ""
+  jpa:
+    hibernate:
+      ddl-auto: update
+    open-in-view: false
+    properties:
+      # Contract field names such as value, result and trigger are reserved words in some databases.
+      hibernate.globally_quoted_identifiers: true
+      hibernate.globally_quoted_identifiers_skip_column_definitions: true
+
+server:
+  port: 8080
+
+halience:
+  brain:
+    # Primitives in a later phase load and validate but don't run.
+    max-phase: 1
+    primitives: classpath*:brain/**/*.md
+    seed-on-startup: true
+    admin-role: admin
+    # Tools with approval: policy need approval at or above this consequence.
+    approval-threshold: medium
+    max-steps-per-run: 12
+    max-cost-cents-per-run: 200
+  llm:
+    # Each thinking level tries these models in order (provider/model, or provider alone). Providers without a
+    # HALIENCE_<PROVIDER>_API_KEY are skipped; the router then picks at the same depth.
+    thinking:
+      low:
+        - anthropic/claude-haiku-5-5
+        - openai/gpt-6-luna
+        - openrouter/google/gemini-3.8-flash
+      medium:
+        - anthropic/claude-sonnet-5-5
+        - openai/gpt-6.1-sol
+        - openrouter/google/gemini-4-argon
+      high:
+        - anthropic/claude-opus-5-5
+        - openai/gpt-6-astra
+        - anthropic/claude-fable-5-1
+  routines:
+    enabled: true
+    tick: PT1M
+    initial-delay: PT2M
+
+logging:
+  level:
+    ai.halience: INFO
+
+---
+spring:
+  config:
+    activate:
+      on-profile: postgres
+  datasource:
+    url: ${HALIENCE_DATABASE_URL}
+    username: ${HALIENCE_DATABASE_USER}
+    password: ${HALIENCE_DATABASE_PASSWORD}
+  jpa:
+    hibernate:
+      ddl-auto: validate

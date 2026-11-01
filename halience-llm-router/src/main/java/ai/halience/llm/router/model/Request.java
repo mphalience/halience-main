@@ -1,0 +1,98 @@
+package ai.halience.llm.router.model;
+
+import java.util.List;
+import java.util.Map;
+
+import ai.halience.llm.router.config.RouterConfig;
+
+import lombok.Builder;
+import lombok.Value;
+import lombok.extern.jackson.Jacksonized;
+
+/**
+ * The unified request shape every call variant on the router ultimately builds — see
+ * {@code LIBRARY_SPEC.md} §3.
+ *
+ * <p>{@code history}, {@code tools}, and {@code attachments} default to an empty list rather
+ * than {@code null} so callers never need a null-check before iterating them; the remaining
+ * optional fields default to {@code null} since they have no natural "empty" value.
+ */
+@Value
+@Builder(toBuilder = true)
+@Jacksonized
+public class Request {
+
+    /** Required — the latest user message. */
+    String prompt;
+
+    @Builder.Default
+    List<Message> history = List.of();
+
+    String systemInstructions;
+
+    /** JSON-Schema-like structured-output schema, as a raw parsed JSON object. */
+    Map<String, Object> responseSchema;
+
+    @Builder.Default
+    List<ToolDefinition> tools = List.of();
+
+    /** Files sent with {@code prompt}. Files shown earlier in the conversation go on their history message instead. */
+    @Builder.Default
+    List<Attachment> attachments = List.of();
+
+    /** Falls back to the router's default config when {@code null}. */
+    RouterConfig config;
+
+    /**
+     * Optional cap on the tokens the model may generate for this request; {@code null} means the
+     * model's own maximum ({@code ModelEntry.maxOutputTokens}). A cap above the model's maximum is
+     * lowered to it. Must be positive when set. On reasoning models the cap includes reasoning
+     * tokens. A response cut off at the cap may be incomplete — for a {@code responseSchema}
+     * request, usually with no {@code structuredOutput}.
+     */
+    Integer maxOutputTokens;
+
+    /**
+     * Resolved from {@code RouterConfig.temperature} during capability negotiation (§4) —
+     * {@code null} if not requested, or dropped because the candidate model doesn't support it.
+     * Not intended to be set directly by callers; set {@code RouterConfig.temperature} instead.
+     */
+    Double temperature;
+
+    /**
+     * Resolved from {@code RouterConfig.topP} during capability negotiation (§4) — {@code null}
+     * if not requested, or dropped because the candidate model doesn't support it. Not intended
+     * to be set directly by callers; set {@code RouterConfig.topP} instead.
+     */
+    Double topP;
+
+    /**
+     * Resolved during capability negotiation (§7.4) from {@code RouterConfig.thinkingLevel} when
+     * {@code RouterConfig.sendThinkingLevel} is set and the model takes an effort level: the
+     * provider's own effort value, e.g. {@code "high"}. {@code null} sends none. Not intended to be
+     * set directly by callers.
+     */
+    String reasoningEffort;
+
+    /**
+     * As {@link #reasoningEffort}, for a model that takes a thinking-token budget instead: the
+     * budget to send. {@code null} sends none (thinking stays at the provider's default). Not
+     * intended to be set directly by callers.
+     */
+    Integer reasoningBudgetTokens;
+
+    /** Every attachment the request carries: those on its history's messages, in order, then {@link #attachments}. */
+    public List<Attachment> everyAttachment() {
+        List<Attachment> every = new java.util.ArrayList<>();
+        for (Message message : history) {
+            every.addAll(message.getAttachments());
+        }
+        every.addAll(attachments);
+        return every;
+    }
+
+    /** Whether {@link #everyAttachment()} is non-empty. */
+    public boolean hasAttachments() {
+        return !attachments.isEmpty() || history.stream().anyMatch(message -> !message.getAttachments().isEmpty());
+    }
+}

@@ -1,0 +1,232 @@
+package ai.halience.agent.loop.compression;
+
+import ai.halience.llm.router.LlmRouter;
+import ai.halience.llm.router.RequestInterceptor;
+import ai.halience.llm.router.capability.ModelCapabilityTable;
+import ai.halience.llm.router.capability.ModelEntry;
+import ai.halience.llm.router.provider.Provider;
+import ai.halience.llm.router.provider.ProviderAdapter;
+import ai.halience.llm.router.model.Request;
+import ai.halience.llm.router.model.Response;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
+
+/**
+ * Compresses a {@link Request} so it fits the context window of the model it's about to be sent
+ * to, trying each {@link CompressionMethod} in a preference list in order — the same
+ * "first one that works wins" shape {@code llm-router} uses for provider fallback — until the
+ * request fits or every method has been exhausted.
+ *
+ * <p>Model context windows are read from {@code llm-router}'s
+ * {@link ModelCapabilityTable}, which is itself a static, class-loaded-once registry — there is
+ * intentionally no separate copy of that data kept here, so this class only ever consults the
+ * single in-memory table {@code llm-router} already maintains.
+ *
+ * <p>Every public overload funnels into {@link #compress(Request, Provider, String, List, LlmRouter)};
+ * callers only need to supply what they want to override.
+ *
+ * <p>{@link #newSelfCompressingRouter} builds an {@link LlmRouter} that runs this compression
+ * automatically, via {@code llm-router}'s {@link RequestInterceptor} hook, against the exact
+ * model each attempt is about to be sent to — the recommended way to get compression for free
+ * without any caller (e.g. {@code AgentLoop}) needing to know about it. Since that hook has no
+ * reference back to whoever made the call, {@link #withListener} is how a caller hears about
+ * what compression did on its behalf.
+ */
+public final class HistoryCompressor {
+
+    /** Estimated token counts are inflated by this fraction before being compared to the context window. */
+    public static final double CONTEXT_WINDOW_SAFETY_MARGIN = 0.05;
+
+    /** Cheapest/most-local method first; the LLM call is always the last resort. */
+    public static final List<CompressionMethod> DEFAULT_METHODS = List.of(
+            CompressionMethod.STRUCTURAL_COMPACTION,
+            CompressionMethod.EXTRACTIVE_SUMMARIZATION,
+            CompressionMethod.LLM_SUMMARIZATION,
+            CompressionMethod.SLIDING_WINDOW_TRUNCATION);
+
+    private static final Map<CompressionMethod, CompressionStrategy> STRATEGIES = Map.of(
+            CompressionMethod.STRUCTURAL_COMPACTION, new StructuralCompactionStrategy(),
+            CompressionMethod.SLIDING_WINDOW_TRUNCATION, new SlidingWindowTruncationStrategy(),
+            CompressionMethod.EXTRACTIVE_SUMMARIZATION, new ExtractiveSummarizationStrategy(),
+            CompressionMethod.LLM_SUMMARIZATION, new LlmSummarizationStrategy());
+
+    /** Bound per caller by {@link #withListener}; read by every {@link #compress} call made in that scope. */
+    private static final ScopedValue<CompressionListener> LISTENER = ScopedValue.newInstance();
+
+    private HistoryCompressor() {
+    }
+
+    /**
+     * Runs {@code work}, reporting every {@link #compress} call it makes — directly, or via a
+     * {@link #newSelfCompressingRouter self-compressing router} — to {@code listener}. Scoped to
+     * the calling thread, so it covers {@code LlmRouter.complete}, whose interceptor runs on the
+     * caller's thread; it does not follow {@code completeAsync} fallbacks onto other threads.
+     */
+    public static <T> T withListener(CompressionListener listener, Supplier<T> work) {
+        Objects.requireNonNull(listener, "listener");
+        return ScopedValue.where(LISTENER, listener).call(work::get);
+    }
+
+    /** Auto-detects credentials (same as {@code new LlmRouter()}); compresses using {@link #DEFAULT_METHODS}. */
+    public static LlmRouter newSelfCompressingRouter() {
+        AtomicReference<LlmRouter> self = new AtomicReference<>();
+        LlmRouter router = new LlmRouter(compressingInterceptor(self, DEFAULT_METHODS));
+        self.set(router);
+        return router;
+    }
+
+    /** Compresses using {@link #DEFAULT_METHODS}. */
+    public static LlmRouter newSelfCompressingRouter(List<ProviderAdapter> adapters) {
+        return newSelfCompressingRouter(adapters, DEFAULT_METHODS);
+    }
+
+    /**
+     * Builds an {@link LlmRouter} that compresses history against the exact model each attempt
+     * targets, immediately before it's sent — see {@link RequestInterceptor}. A caller that wants
+     * this for free (e.g. {@code AgentLoop}) just builds its router this way instead of
+     * {@code new LlmRouter(adapters)} and otherwise changes nothing.
+     *
+     * <p>{@link CompressionExhaustedException} and an unknown/off-table target model both
+     * propagate out of the hook rather than being swallowed — {@code llm-router} treats that the
+     * same as any other in-attempt failure (§5.1) and falls back to the next candidate, which may
+     * have a larger context window and not need compression at all.
+     *
+     * <p>Compressions are kept stable from call to call: a request whose history starts with one this router
+     * already compressed for the same model reuses that compressed start and only appends to it, and is compressed
+     * again only when that no longer fits. So an agent loop's calls keep the same prefix (and stay readable from
+     * the provider's prompt cache), and an LLM summary is made once rather than on every call.
+     *
+     * @param adapters explicit adapters, same as {@code new LlmRouter(adapters)}
+     * @param methods  ordered preference list of {@link CompressionMethod} to try on every attempt
+     */
+    public static LlmRouter newSelfCompressingRouter(List<ProviderAdapter> adapters, List<CompressionMethod> methods) {
+        Objects.requireNonNull(adapters, "adapters");
+        AtomicReference<LlmRouter> self = new AtomicReference<>();
+        LlmRouter router = new LlmRouter(adapters, compressingInterceptor(self, methods));
+        self.set(router);
+        return router;
+    }
+
+    /**
+     * {@code self} is set immediately after the {@link LlmRouter} it's installed into is
+     * constructed — safe because the interceptor is never invoked until a call is actually made,
+     * which can't happen before that constructor returns.
+     */
+    private static RequestInterceptor compressingInterceptor(AtomicReference<LlmRouter> self, List<CompressionMethod> methods) {
+        return interceptor(self, methods);
+    }
+
+    /**
+     * The {@link RequestInterceptor} {@link #newSelfCompressingRouter} installs — compressing with {@code methods},
+     * stably from call to call — for a router built some other way. Set {@code self} to that router once it's
+     * built; {@code LLM_SUMMARIZATION} calls go through it.
+     */
+    public static RequestInterceptor interceptor(AtomicReference<LlmRouter> self, List<CompressionMethod> methods) {
+        CompressionMemo memo = new CompressionMemo();
+        return (provider, model, request) -> memo.compress(request, provider, model,
+                candidate -> compress(candidate, provider, model, methods, self.get()).request());
+    }
+
+    /** Tells the bound {@link CompressionListener}, if any, about a model call compression made. */
+    static void reportModelCall(Response response) {
+        if (LISTENER.isBound()) {
+            LISTENER.get().modelCall(response);
+        }
+    }
+
+    /** {@code tokens}, lowered to the bound listener's {@link CompressionListener#summaryOutputTokens()} cap, if any. */
+    static int summaryOutputTokens(int tokens) {
+        Integer cap = LISTENER.isBound() ? LISTENER.get().summaryOutputTokens() : null;
+        return cap == null ? tokens : Math.min(tokens, cap);
+    }
+
+    /** Compresses using {@link #DEFAULT_METHODS} and no LLM fallback available. */
+    public static CompressionOutcome compress(Request request, Provider provider, String model) {
+        return compress(request, provider, model, DEFAULT_METHODS, null);
+    }
+
+    /** Compresses using {@link #DEFAULT_METHODS}, with {@code router} available for {@link CompressionMethod#LLM_SUMMARIZATION}. */
+    public static CompressionOutcome compress(Request request, Provider provider, String model, LlmRouter router) {
+        return compress(request, provider, model, DEFAULT_METHODS, router);
+    }
+
+    /** Compresses using a caller-supplied method preference list, with no LLM fallback available. */
+    public static CompressionOutcome compress(
+            Request request, Provider provider, String model, List<CompressionMethod> methods) {
+        return compress(request, provider, model, methods, null);
+    }
+
+    /**
+     * Compresses {@code request} so its estimated token count (plus {@link #CONTEXT_WINDOW_SAFETY_MARGIN})
+     * fits within {@code model}'s context window, minus room for its max output tokens.
+     *
+     * @param request the request to compress
+     * @param provider provider of the model this request is about to be sent to
+     * @param model    model id, looked up in {@link ModelCapabilityTable}
+     * @param methods  ordered preference list of {@link CompressionMethod} to try; {@code null} or empty means {@link #DEFAULT_METHODS}
+     * @param router   used for {@link CompressionMethod#LLM_SUMMARIZATION}; may be {@code null} if that method isn't in the list
+     * @return the (possibly unchanged) request to send, plus a record of what was tried
+     * @throws IllegalArgumentException     if {@code provider}/{@code model} isn't in {@link ModelCapabilityTable}
+     * @throws CompressionExhaustedException if every method was tried and the request still doesn't fit
+     */
+    public static CompressionOutcome compress(
+            Request request, Provider provider, String model, List<CompressionMethod> methods, LlmRouter router) {
+        Objects.requireNonNull(request, "request");
+        Objects.requireNonNull(provider, "provider");
+        Objects.requireNonNull(model, "model");
+
+        List<CompressionMethod> orderedMethods = (methods == null || methods.isEmpty()) ? DEFAULT_METHODS : methods;
+
+        ModelEntry targetModel = ModelCapabilityTable.findModel(provider, model)
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "Unknown model for compression target: " + provider + "/" + model));
+
+        int targetTokens = Math.max(targetModel.getContextWindowTokens() - targetModel.getMaxOutputTokens(), 0);
+        int estimatedTokens = RequestTokenEstimator.estimateTokensWithMargin(request, CONTEXT_WINDOW_SAFETY_MARGIN);
+
+        if (estimatedTokens <= targetTokens) {
+            return CompressionOutcome.notNeeded(request, estimatedTokens, targetTokens);
+        }
+
+        List<CompressionAttempt> attempts = new ArrayList<>(orderedMethods.size());
+        Request current = request;
+        int currentTokens = estimatedTokens;
+
+        for (CompressionMethod method : orderedMethods) {
+            CompressionStrategy strategy = STRATEGIES.get(method);
+            try {
+                Request candidate = strategy.compress(current, targetTokens, router);
+                int candidateTokens = RequestTokenEstimator.estimateTokensWithMargin(candidate, CONTEXT_WINDOW_SAFETY_MARGIN);
+
+                if (candidateTokens < currentTokens) {
+                    attempts.add(CompressionAttempt.success(method, currentTokens, candidateTokens));
+                    current = candidate;
+                    currentTokens = candidateTokens;
+                    if (currentTokens <= targetTokens) {
+                        CompressionOutcome outcome =
+                                CompressionOutcome.compressed(current, estimatedTokens, currentTokens, targetTokens, attempts);
+                        if (LISTENER.isBound()) {
+                            LISTENER.get().compressed(provider, model, outcome);
+                        }
+                        return outcome;
+                    }
+                } else {
+                    attempts.add(CompressionAttempt.failure(method, currentTokens, "no token reduction achieved"));
+                }
+            } catch (RuntimeException e) {
+                attempts.add(CompressionAttempt.failure(method, currentTokens, e.getMessage()));
+            }
+        }
+
+        CompressionExhaustedException exhausted = new CompressionExhaustedException(targetTokens, currentTokens, attempts);
+        if (LISTENER.isBound()) {
+            LISTENER.get().exhausted(provider, model, exhausted);
+        }
+        throw exhausted;
+    }
+}
